@@ -28,101 +28,52 @@ The goal of NoProp is to train neural networks without relying on traditional en
 * **Method:** NoProp-DT (Discrete-Time variant)
 * **Dataset:** MNIST
 * **Architecture:** Based on Figure 6 (left) from the paper's appendix (CNN for image path, MLP for label embedding path, combined layers).
-* **Embeddings:** Uses learned embeddings (`dim=20`) with orthogonal initialization (one of the strategies explored in the paper; easily modifiable to fixed one-hot).
-* **Noise Schedule:** Cosine schedule for `alpha_bar`.
-* **Inference:** Implemented according to Equation 3 from the paper, including calculation of coefficients `a_t, b_t, c_t` (with heuristics for handling the `t=1` boundary condition).
+* **Embeddings:** Experiments were run with:
+    * Learned embeddings (`dim=20`) with orthogonal initialization.
+    * Fixed one-hot embeddings (`dim=10`).
+* **Noise Schedule:** Cosine schedule.
+* **Inference:** Implemented according to Equation 3 from the paper, including coefficient calculation (with heuristics for handling the `t=1` boundary condition).
+* **Optimizer:** AdamW with Weight Decay and Cosine Annealing LR Scheduler.
+* **Epochs:** Trained for 100 epochs.
 
-## Current Status (as of April 9, 2025)
+## Current Status & Experimental Results *(Updated Apr 9, 2025)*
 
-The implementation runs and demonstrates the mechanics of independent layer training and the specific NoProp inference process. However, convergence on the MNIST classification task is currently observed to be **very slow**.
+Experiments were conducted to replicate the NoProp-DT results on MNIST, aligning hyperparameters (`T=10`, `LR`, `WD`, `BS`, `eta`, `Epochs=100`) and architecture choices more closely with the paper.
 
-* After ~44 epochs (out of 100 planned), the classification cross-entropy loss decreased to ~1.96. This is significantly better than random guessing (~2.3) but still indicates low classification accuracy.
-* The denoising loss (`AvgDenoiseLoss`) settled at a non-zero value (e.g., ~0.05-0.1), potentially due to the adaptation required for learnable embeddings acting as a moving target.
+Two main configurations were tested for 100 epochs:
 
-Further tuning, potentially more epochs, or closer adherence to all details from the original paper (e.g., alternative embedding strategies) might be required to achieve higher performance.
+1.  **Learned Embeddings (dim=20, Orthogonal Init):**
+    * Training `Classify Loss` decreased steadily, reaching **~0.98** by epoch 100.
+    * Training `AvgDenoiseLoss` remained non-zero, increasing to ~0.32 towards the end.
+    * **Final Test Accuracy (via Inference): ~11.35%**
 
-## Implementation Specifics and Differences from Paper
+2.  **Fixed One-Hot Embeddings (dim=10):**
+    * Training `Classify Loss` **did not decrease**, remaining at the random guess level (~2.30) for all 100 epochs.
+    * Training `AvgDenoiseLoss` successfully reached near zero, as expected with a fixed target.
+    * **Final Test Accuracy (via Inference): ~10.27%** (effectively random chance).
 
-This implementation attempts to follow the NoProp-DT method but includes several simplifications, specific choices, and potential deviations from the authors' original (unpublished) code:
+**Outcome:** Neither configuration achieved satisfactory classification performance or came close to replicating the >99% accuracy reported in the source paper for MNIST with NoProp-DT.
 
-1.  **Boundary Condition Handling (t=1):**
-    * **SNR Weight in Loss:** The weight term `SNR(t) - SNR(t-1)` is theoretically problematic at `t=1` (as `SNR(0)` is infinite). This code uses an **approximation**, setting the weight for `t=1` (index `t_idx=0`) equal to `SNR(1)`. The paper does not detail its exact handling of this boundary in the final objective (Eq. 8).
-    * **Inference Coefficients (a₁, b₁, c₁):** The formulas for inference coefficients also lead to division by zero (`1 - alpha_bar_0`) at `t=1`. This code uses **`torch.clamp(..., min=1e-6)`** on the denominator and a **heuristic (`alpha_0 = alpha_1`)** for the numerator terms involving `alpha_0`. This allows the code to run but its theoretical correctness and alignment with the authors' approach at the first step are uncertain.
+## Conclusions from Experiments
 
-2.  **Class Embedding Strategy (`W_Embed`):**
-    * This code implements **one** specific strategy: learned embeddings (`dim=20`) with orthogonal initialization.
-    * The paper also explored and reported good results with **fixed one-hot embeddings** and **learned "prototypes"**. These alternatives are not implemented as easily switchable options here (though one-hot can be achieved with code modifications). The choice of embedding strategy can significantly impact results.
+* **Replication Challenges:** Reproducing the high accuracy reported in the paper proved unsuccessful with this implementation, despite aligning hyperparameters and architecture based on the paper's description.
+* **Local vs. Global Learning:** The experiments clearly show that successfully training the blocks for their local denoising task (`AvgDenoiseLoss` -> 0, especially with fixed targets) **does not guarantee** effective performance on the global classification task when the blocks are composed during the inference process (Eq. 3).
+* **Inference Discrepancy:** The significant gap between the final training classification loss (reaching ~0.98 in the learned embedding run) and the very low test accuracy suggests a major discrepancy. The representation `z_T` generated via the iterative inference process is likely very different from the distribution `q(z_T|y)` the classifier was trained on, or the inference process itself fails to produce class-discriminative features in this setup.
+* **Potential Bottlenecks:** The most likely reasons for failure include:
+    * Incorrect or suboptimal handling of the **boundary conditions at t=1** (for SNR loss weight and inference coefficients `a,b,c`) due to theoretical ambiguity and practical workarounds used (`clamp`, `alpha_0` heuristic).
+    * Other subtle differences in implementation details or hyperparameters compared to the authors' original (unpublished) code.
 
-3.  **Objective Function:**
-    * The KL divergence term `D_KL(q(z_0|y)||p(z_0))` from the full ELBO objective (Eq. 8) is **ignored** during loss calculation and weight updates in this implementation. While often constant w.r.t. model parameters, it's formally part of the objective described.
-
-4.  **Classifier Parameterization (`p_theta_out`):**
-    * The standard approach is used: a linear layer followed by `CrossEntropyLoss` (equivalent to Softmax + NLLLoss, corresponding to Eq. 14 in the paper).
-    * An alternative method based on radial distance to embeddings (Eq. 15, 16), also proposed and tested in the paper, is **not implemented**.
-
-5.  **Hyperparameter Exploration:**
-    * The code uses a single set of hyperparameters (mostly aligned with Table 3 for MNIST/NoProp-DT). The original work likely involved exploration and tuning to find optimal values, and results for different configurations (like embedding types in Table 1) were presented.
-
-6.  **Optimizations and Code Details:**
-    * This implementation is conceptual and may differ from the authors' code in minor details (e.g., specific weight initializations for convolutions, BatchNorm parameters, speed/memory optimizations).
-
-These differences and simplifications are important context for understanding the current implementation's behavior and performance relative to the results claimed in the original paper.
+* **Overall:** This implementation serves as a demonstration of the NoProp-DT mechanics but highlights the significant challenges in achieving high performance with this method without potentially more detailed guidance or resolving implementation ambiguities.
 
 ## Setup
 
+*(Setup instructions remain the same as before - using venv/manual)*
+
 **Option 1: Using `venv` (Recommended)**
-
-1.  Ensure you have Python 3 installed.
-2.  Clone the repository:
-    ```bash
-    git clone <your-repository-url>
-    cd <your-repository-name>
-    ```
-3.  Run the setup script (creates `noprop_env` virtual environment and installs dependencies):
-    ```bash
-    chmod +x setup_env.sh
-    ./setup_env.sh
-    ```
-4.  **Activate the environment:**
-    * Linux/macOS:
-        ```bash
-        source noprop_env/bin/activate
-        ```
-    * Windows:
-        ```bash
-        noprop_env\Scripts\activate
-        ```
-
-**Option 2: Manual Setup (using `venv`)**
-
-1.  Clone the repository and navigate into it.
-2.  Create a virtual environment: `python3 -m venv noprop_env`
-3.  Activate it (see commands above).
-4.  Upgrade pip: `pip install --upgrade pip`
-5.  Install dependencies:
-    ```bash
-    pip install torch torchvision numpy
-    ```
-    *(Note: Ensure you install the correct PyTorch version for your system/CUDA. See [https://pytorch.org/](https://pytorch.org/))*
-
-## Usage
-
-1.  Activate the virtual environment (if not already active).
-2.  Run the main script:
-    ```bash
-    python noprop_example.py
-    ```
-The script will perform training for the configured number of epochs, print loss values periodically, and finally run evaluation on the MNIST test set using the NoProp inference procedure, reporting the accuracy.
-
-## Files
-
-* `noprop_example.py`: The main Python script containing the NoProp implementation, training loop, and inference function.
-* `setup_env.sh`: Shell script to automate environment setup using `venv`.
-* `README.md`: This file.
-
-## Dependencies
-
-* Python 3.x
-* PyTorch (e.g., 2.x)
-* Torchvision
-* NumPy
+1. Ensure you have Python 3 installed.
+2. Clone the repository: `git clone <your-repository-url>`
+3. Navigate to the project directory: `cd <your-repository-name>`
+4. Run the setup script (this will create a virtual environment named `noprop_env` and install dependencies):
+   ```bash
+   chmod +x setup_env.sh
+   ./setup_env.sh
