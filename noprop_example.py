@@ -8,8 +8,8 @@ import numpy as np
 import math
 
 # --- Hyperparameters ---
-T = 105  # Number of "layers" or diffusion steps (Reduced for simplicity)
-EMBED_DIM = 256 # Dimension for label embeddings
+T = 20  # Number of "layers" or diffusion steps (Reduced for simplicity)
+EMBED_DIM = 128 # Dimension for label embeddings
 NUM_CLASSES = 10
 IMG_SIZE = 28
 IMG_CHANNELS = 1
@@ -62,55 +62,94 @@ label_embedding.weight.data.normal_(0, 0.1) # Initialize randomly
 # Each block u_theta_t needs to process image x and noisy label z_{t-1}
 # Based loosely on Figure 6 but highly simplified
 
-class DenoisingBlock(nn.Module):
-    def __init__(self, embed_dim, img_channels=1):
+class DenoisingBlockPaper(nn.Module):
+    def __init__(self, embed_dim, img_channels=1, img_size=28):
         super().__init__()
-        self.img_embed = nn.Sequential(
-            nn.Conv2d(img_channels, 16, kernel_size=3, padding=1), nn.ReLU(),
-            nn.MaxPool2d(2), # 28x28 -> 14x14
-            nn.Conv2d(16, 32, kernel_size=3, padding=1), nn.ReLU(),
+        self.embed_dim = embed_dim
+
+        # --- Путь обработки изображения (x) ---
+        self.img_conv = nn.Sequential(
+            nn.Conv2d(img_channels, 32, kernel_size=3, padding=1), nn.ReLU(),
+            nn.MaxPool2d(2), # 28x28 -> 14x14 (для MNIST)
+            nn.Conv2d(32, 64, kernel_size=3, padding=1), nn.ReLU(),
             nn.MaxPool2d(2), # 14x14 -> 7x7
-            nn.Flatten(),
-            nn.Linear(32 * 7 * 7, 128), nn.ReLU()
+            nn.Conv2d(64, 128, kernel_size=3, padding=1), nn.ReLU(),
+            nn.MaxPool2d(2), # 7x7 -> 3x3 (убедитесь, что размер корректен для ваших данных)
+            nn.Flatten()
         )
+        # Рассчитываем размер после сверток и пулинга
+        # Для MNIST (1, 28, 28) -> (128, 3, 3) -> 128 * 3 * 3 = 1152
+        # Для CIFAR (3, 32, 32) -> (128, 4, 4) -> 128 * 4 * 4 = 2048
+        # Сделаем расчет динамическим, если возможно, или зададим явно
+        with torch.no_grad():
+             dummy_input = torch.zeros(1, img_channels, img_size, img_size)
+             conv_output_size = self.img_conv(dummy_input).shape[-1]
+
+        self.img_fc = nn.Sequential(
+            nn.Linear(conv_output_size, 256),
+            nn.BatchNorm1d(256), # BatchNorm ПЕРЕД ReLU как на схеме
+            nn.ReLU(),
+            nn.Dropout(0.2)
+        )
+
+        # --- Путь обработки зашумленной метки (z_t_minus_1) ---
+        # Диаграмма показывает 2 слоя FC(256) -> BN -> ReLU -> Dropout
         self.label_embed = nn.Sequential(
-            nn.Linear(embed_dim, 128), nn.ReLU(),
-            nn.Linear(128, 128), nn.ReLU()
+            nn.Linear(self.embed_dim, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.2)
         )
+
+        # --- Комбинированный путь после конкатенации ---
+        # Вход: 256 (от img_fc) + 256 (от label_embed) = 512
         self.combined = nn.Sequential(
-            nn.Linear(128 + 128, 256), nn.ReLU(),
-            nn.Linear(256, embed_dim) # Predicts the original embedding u_y
+            nn.Linear(256 + 256, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            # Выходной слой блока предсказывает u_y, поэтому размер embed_dim
+            nn.Linear(128, self.embed_dim)
         )
 
     def forward(self, x, z_t_minus_1):
-        img_features = self.img_embed(x)
+        img_features_conv = self.img_conv(x)
+        img_features = self.img_fc(img_features_conv)
+
         label_features = self.label_embed(z_t_minus_1)
+
         combined_features = torch.cat([img_features, label_features], dim=1)
         predicted_u_y = self.combined(combined_features)
         return predicted_u_y
 
+
 class NoPropNet(nn.Module):
-    def __init__(self, num_blocks, embed_dim, num_classes, img_channels=1):
+    def __init__(self, num_blocks, embed_dim, num_classes, img_channels=1, img_size=28): # Добавлен img_size
         super().__init__()
         self.num_blocks = num_blocks
-        # Create T independent blocks
+        # Создаем T независимых блоков новой архитектуры
         self.blocks = nn.ModuleList([
-            DenoisingBlock(embed_dim, img_channels) for _ in range(num_blocks)
+            # Используем новый класс блока
+            DenoisingBlockPaper(embed_dim, img_channels, img_size)
+            for _ in range(num_blocks)
         ])
-        # Final classifier layer (p_theta_out in paper) - acts on z_T
+        # Финальный классификатор остается тем же
         self.classifier = nn.Linear(embed_dim, num_classes)
 
-    # Note: Forward pass here is only conceptual for inference. Training is different.
+    # Концептуальный forward для inference (НЕ используется в NOPROP обучении)
     def forward(self, x, z_0):
-        # This implements a simplified inference pass (ignoring noise addition etc. from Eq 3)
-        # This part IS NOT USED during NoProp training loop below.
         z_t = z_0
         for t in range(self.num_blocks):
+            # Используем блок t для предсказания u_y
             pred_u_y = self.blocks[t](x, z_t)
-            # Simplified update: just use the prediction
-            # Proper inference requires Eq. 3: z_t = a_t*pred_u_y + b_t*z_{t-1} + noise
-            z_t = pred_u_y # Very simplified stand-in for actual inference update
-        
+            # Упрощенное обновление (требует реализации Ур. 3 для корректного inference)
+            z_t = pred_u_y
         logits = self.classifier(z_t)
         return logits
 
@@ -120,7 +159,7 @@ trainset = torchvision.datasets.MNIST(root='./data', train=True, download=True, 
 trainloader = DataLoader(trainset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
 
 # --- 5. Initialization ---
-model = NoPropNet(num_blocks=T, embed_dim=EMBED_DIM, num_classes=NUM_CLASSES, img_channels=IMG_CHANNELS).to(DEVICE)
+model = NoPropNet(num_blocks=T, embed_dim=EMBED_DIM, num_classes=NUM_CLASSES, img_channels=IMG_CHANNELS, img_size=IMG_SIZE).to(DEVICE)
 # Separate optimizer for each block + one for classifier/embeddings
 optimizers = [optim.Adam(block.parameters(), lr=LR) for block in model.blocks]
 optimizer_final = optim.Adam(list(model.classifier.parameters()) + list(label_embedding.parameters()), lr=LR) # Include label_embedding if learnable
