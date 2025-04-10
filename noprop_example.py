@@ -1,405 +1,390 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 import numpy as np
 import math
-import time  # Для замера времени
+import time # Для замера времени
 
 # --- Hyperparameters ---
-# Number of "layers" or diffusion steps (Можно увеличить до 10, как в статье)
 T = 10
-# Dimension for label embeddings (В статье были и другие значения)
 EMBED_DIM = 20
 NUM_CLASSES = 10
 IMG_SIZE = 28
 IMG_CHANNELS = 1
 BATCH_SIZE = 128
-EPOCHS = 100  # Увеличено количество эпох
-LR = 1e-3
+EPOCHS = 100
+LR = 1e-4 # Оставим пониженный LR
+WEIGHT_DECAY = 1e-3 # WD для блоков и классификатора
+EMBED_WD = 1e-5 # Маленький WD для эмбеддингов
+MAX_NORM_EMBED = 50.0 # Порог для клиппинга нормы эмбеддингов
+GRAD_CLIP_MAX_NORM = 1.0 # Порог для клиппинга градиентов
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-ETA_LOSS_WEIGHT = 0.1  # Corresponds to eta in Eq. 8 (from Table 3)
+# ETA_LOSS_WEIGHT больше не нужен напрямую, используем равномерный вес для MSE(epsilon)
+ETA_LOSS_WEIGHT = 1.0
 
 print(f"Using device: {DEVICE}")
-print(f"Parameters: T={T}, EmbedDim={EMBED_DIM}, Epochs={EPOCHS}, LR={LR}")
+print(f"Parameters: T={T}, EmbedDim={EMBED_DIM}, Epochs={EPOCHS}, LR={LR}, WD={WEIGHT_DECAY}, EmbedWD={EMBED_WD}")
+print(f"NormClipEmbed={MAX_NORM_EMBED}, GradClip={GRAD_CLIP_MAX_NORM}")
+print("!!! Training Target: Predicting Noise (epsilon) !!!")
 
-# --- 1. Noise Schedule (Обновлено для Inference) ---
-
-
+# --- 1. Noise Schedule (Cosine schedule) ---
 def get_alpha_bar_schedule(timesteps, s=0.008):
-    """Generates cosine schedule alphas_cumprod (alpha_bar) including alpha_bar_0 = 1."""
     steps = timesteps + 1
-    x = torch.linspace(0, timesteps, steps,
-                       dtype=torch.float32)  # 0, 1, ..., T
-    alphas_cumprod = torch.cos(
-        ((x / timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
-    alphas_cumprod = alphas_cumprod / \
-        alphas_cumprod[0]  # Ensure alpha_bar_0 = 1
-    return torch.clip(alphas_cumprod, 0.0001, 1.0)
+    x = torch.linspace(0, timesteps, steps, dtype=torch.float32)
+    alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    return torch.clip(alphas_cumprod, 0.0001, 0.9999)
 
+alphas_bar = get_alpha_bar_schedule(T).to(DEVICE) # Size T+1, [alpha_bar_0, ..., alpha_bar_T]
+alphas = alphas_bar[1:] / alphas_bar[:-1]       # Size T,   [alpha_1, ..., alpha_T]
+betas = 1.0 - alphas                            # Size T,   [beta_1, ..., beta_T]
 
-# Size T+1, index 0..T maps to alpha_bar_0..alpha_bar_T
-alphas_bar = get_alpha_bar_schedule(T).to(DEVICE)
+# --- Precompute values needed for sampling q(z_t|y) and inference ---
+# Индексы 0..T соответствуют временным шагам статьи 0..T
+sqrt_alphas_bar = torch.sqrt(alphas_bar)
+sqrt_one_minus_alphas_bar = torch.sqrt(1.0 - alphas_bar)
 
-# Derive alpha_t = alpha_bar_t / alpha_bar_{t-1} for t=1..T
-# alphas[t] corresponds to alpha_{t+1} in paper's 1..T indexing
-# Size T, index 0..T-1 maps to alpha_1..alpha_T
-alphas = alphas_bar[1:] / alphas_bar[:-1]
+# Для DDPM inference step (t идет от T до 1, используем индекс t-1 для доступа)
+# Нужны alpha_t, beta_t, alpha_bar_t, alpha_bar_{t-1}
+sqrt_recip_alphas = 1.0 / torch.sqrt(alphas) # index 0..T-1 -> 1/sqrt(alpha_1)...1/sqrt(alpha_T)
+# Variance of q(z_{t-1} | z_t, z_0): beta_tilde_t = beta_t * (1-alpha_bar_{t-1}) / (1-alpha_bar_t)
+# Индекс t-1 соответствует t шагу статьи (1..T)
+posterior_variance = betas * (1.0 - alphas_bar[:-1]) / (1.0 - alphas_bar[1:]) # index 0..T-1 -> beta_tilde_1...beta_tilde_T
 
-# Precompute sqrt values needed for training q(z_t | y)
-# Index 0..T-1 maps to paper t=1..T
-sqrt_alphas_cumprod_train = torch.sqrt(alphas_bar[1:])
-sqrt_one_minus_alphas_cumprod_train = torch.sqrt(1.0 - alphas_bar[1:])
-
-# SNR calculations for training loss - based on paper t=1..T (index 0..T-1)
-# Avoid division by zero
-snr = alphas_bar[1:] / torch.clamp(1.0 - alphas_bar[1:], min=1e-6)
-snr_diff = torch.zeros_like(snr)
-# Paper uses SNR(t) - SNR(t-1). Need SNR(0) for t=1.
-# We approximate SNR(0) using SNR(1) value, or simply use SNR(1) for the first term's weight.
-# Let's use clamp to avoid issues with near-zero values if alpha_bar_1 is near 1.
-snr_diff[0] = snr[0]  # Weight for t=1 (index 0)
-snr_diff[1:] = snr[1:] - snr[:-1]
-# Ensure weight is positive, factor 0.5 from Eq 56
-# Index 0..T-1 maps to weights for t=1..T
-snr_loss_weight = 0.5 * torch.abs(snr_diff)
-
-# --- Precompute coefficients a_t, b_t, sqrt_c_t for INFERENCE ---
-# t goes from 1 to T (paper index). Code index t_idx = 0 to T-1.
-a_coeffs = []
-b_coeffs = []
-sqrt_c_coeffs = []
-
-# Handle boundary case t=1 (t_idx=0) using heuristic alpha_0 = alpha_1
-# alpha_1 is alphas[0]
-alpha_0_heuristic = alphas[0]
-alpha_bar_0 = alphas_bar[0]  # Should be 1.0
-
-for t_idx in range(T):  # t_idx = 0..T-1 corresponds to paper t = 1..T
-    alpha_bar_t = alphas_bar[t_idx + 1]
-    alpha_bar_t_minus_1 = alphas_bar[t_idx]
-
-    # Use heuristic for alpha_{t-1} when t=1 (t_idx=0) -> corresponds to alpha_0
-    alpha_t_minus_1 = alpha_0_heuristic if t_idx == 0 else alphas[t_idx - 1]
-
-    # Clamp denominator slightly away from zero for stability
-    denom = torch.clamp(1.0 - alpha_bar_t_minus_1, min=1e-6)
-
-    a_t = (torch.sqrt(alpha_bar_t) * (1.0 - alpha_t_minus_1)) / denom
-    b_t = (torch.sqrt(torch.clamp(alpha_t_minus_1, min=1e-6)) *
-           (1.0 - alpha_bar_t)) / denom  # Clamp alpha_t_minus_1 before sqrt
-    c_t = ((1.0 - alpha_bar_t) * (1.0 - alpha_t_minus_1)) / denom
-    sqrt_c_t = torch.sqrt(torch.clamp(c_t, min=1e-6))  # Clamp c_t before sqrt
-
-    a_coeffs.append(a_t)
-    b_coeffs.append(b_t)
-    sqrt_c_coeffs.append(sqrt_c_t)
-
-# Convert lists to tensors and reshape for broadcasting
-# Shape [T, 1, 1] for broadcasting over [B, EmbDim]
-a_coeffs = torch.stack(a_coeffs).view(T, 1, 1).to(DEVICE)
-b_coeffs = torch.stack(b_coeffs).view(T, 1, 1).to(DEVICE)
-sqrt_c_coeffs = torch.stack(sqrt_c_coeffs).view(T, 1, 1).to(DEVICE)
-
-print("Noise schedule and Inference coefficients a, b, sqrt(c) precomputed.")
-
+print("Noise schedule and necessary coefficients precomputed.")
 
 # --- 2. Label Embeddings ---
-# Using learnable embeddings
 label_embedding = nn.Embedding(NUM_CLASSES, EMBED_DIM).to(DEVICE)
-
-if NUM_CLASSES <= EMBED_DIM:
-    try: # Добавим try-except на случай редких проблем с размерностями
-        nn.init.orthogonal_(label_embedding.weight)
-        print(f"Applied orthogonal initialization to label embeddings (dim={EMBED_DIM}).")
-    except ValueError as e:
-         print(f"Warning: Orthogonal init failed ({e}). Using default init.")
-else:
-    # В нашем случае NUM_CLASSES=10, EMBED_DIM=20, условие выполняется
-    print(f"Warning: Cannot apply orthogonal init (num_classes {NUM_CLASSES} > embed_dim {EMBED_DIM}). Using default init.")
+print(f"Applying orthogonal initialization to {EMBED_DIM}-dim embeddings.")
+try:
+    nn.init.orthogonal_(label_embedding.weight)
+except ValueError as e:
+    print(f"Warning: Orthogonal init failed ({e}). Using default init.")
 
 
-# --- 3. Model Architecture (ближе к Рисунку 6, слева) ---
+# --- 3. Model Architecture (Блок предсказывает epsilon) ---
 class DenoisingBlockPaper(nn.Module):
+    # Убираем num_classes, так как выход теперь embed_dim (предсказание шума)
+    # Убираем W_embed из forward, так как он не нужен для предсказания шума напрямую
     def __init__(self, embed_dim, img_channels=1, img_size=28):
         super().__init__()
         self.embed_dim = embed_dim
 
-        # --- Путь обработки изображения (x) ---
+        # --- Image processing path (x) ---
         self.img_conv = nn.Sequential(
             nn.Conv2d(img_channels, 32, kernel_size=3, padding=1), nn.ReLU(),
-            nn.MaxPool2d(2),  # 28x28 -> 14x14
+            nn.MaxPool2d(2),
             nn.Conv2d(32, 64, kernel_size=3, padding=1), nn.ReLU(),
-            nn.MaxPool2d(2),  # 14x14 -> 7x7
+            nn.MaxPool2d(2),
             nn.Conv2d(64, 128, kernel_size=3, padding=1), nn.ReLU(),
-            nn.MaxPool2d(2),  # 7x7 -> 3x3
+            nn.AdaptiveAvgPool2d((3, 3)),
             nn.Flatten()
         )
-        # Рассчитываем размер после сверток и пулинга
         with torch.no_grad():
-            dummy_input = torch.zeros(1, img_channels, img_size, img_size)
-            conv_output_size = self.img_conv(dummy_input).shape[-1]
-            # print(f"Calculated conv output size: {conv_output_size}") # Debugging
-
+             dummy_input = torch.zeros(1, img_channels, img_size, img_size)
+             conv_output_size = self.img_conv(dummy_input).shape[-1]
         self.img_fc = nn.Sequential(
             nn.Linear(conv_output_size, 256),
-            nn.BatchNorm1d(256),  # BatchNorm ПЕРЕД ReLU
-            nn.ReLU(),
-            nn.Dropout(0.2)
+            nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(0.2)
         )
 
-        # --- Путь обработки зашумленной метки (z_t_input for block t) ---
-        self.label_embed = nn.Sequential(
+        # --- Noisy embedding processing path (z_input) ---
+        self.label_embed_proc = nn.Sequential(
             nn.Linear(self.embed_dim, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Dropout(0.2),
+            nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(0.2),
             nn.Linear(256, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Dropout(0.2)
+            nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(0.2)
         )
 
-        # --- Комбинированный путь после конкатенации ---
+        # --- Combined path -> outputs predicted epsilon (size embed_dim) ---
         self.combined = nn.Sequential(
             nn.Linear(256 + 256, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
+            nn.BatchNorm1d(256), nn.ReLU(),
             nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            # Выходной слой блока предсказывает u_y, поэтому размер embed_dim
-            nn.Linear(128, self.embed_dim)
+            nn.BatchNorm1d(128), nn.ReLU(),
+            nn.Linear(128, self.embed_dim) # Output predicted noise
         )
 
-    # Input z_t_sampled is z_t sampled from q(z_t|y) for training block t+1 (paper index)
-    # Or z_{t-1} generated during inference for inference step t (paper index)
+    # z_input это z_{t-1} (paper index) sampled from q(z_{t-1}|y)
+    # Блок t (paper index) предсказывает epsilon, добавленный на шаге t-1->t
+    # Убираем W_embed из аргументов
     def forward(self, x, z_input):
-        img_features_conv = self.img_conv(x)
-        img_features = self.img_fc(img_features_conv)
-
-        label_features = self.label_embed(z_input)
-
+        img_features = self.img_fc(self.img_conv(x))
+        label_features = self.label_embed_proc(z_input)
         combined_features = torch.cat([img_features, label_features], dim=1)
-        predicted_u_y = self.combined(combined_features)
-        return predicted_u_y
-
+        predicted_epsilon = self.combined(combined_features)
+        return predicted_epsilon
 
 class NoPropNet(nn.Module):
+    # Убираем num_classes из конструктора блоков
     def __init__(self, num_blocks, embed_dim, num_classes, img_channels=1, img_size=28):
         super().__init__()
         self.num_blocks = num_blocks
-        self.embed_dim = embed_dim  # Store embed_dim
-        # Создаем T независимых блоков новой архитектуры
+        self.embed_dim = embed_dim
+        self.num_classes = num_classes
         self.blocks = nn.ModuleList([
-            DenoisingBlockPaper(embed_dim, img_channels, img_size)
+            DenoisingBlockPaper(embed_dim, img_channels, img_size) # Убран num_classes
             for _ in range(num_blocks)
         ])
-        # Финальный классификатор остается тем же
         self.classifier = nn.Linear(embed_dim, num_classes)
 
-    # Этот forward НЕ используется для обучения NoProp, только для примера/концепции
+    # Conceptual forward (not used)
     def forward(self, x, z_0):
-        # Conceptual inference pass (simplified, use run_inference instead)
         print("Warning: NoPropNet.forward is conceptual only. Use run_inference.")
-        z_t = z_0
-        for t in range(self.num_blocks):
-            pred_u_y = self.blocks[t](x, z_t)
-            z_t = pred_u_y  # Incorrect update for actual inference
-        logits = self.classifier(z_t)
-        return logits
-
+        # ... (старый концептуальный код нерелевантен)
+        return None
 
 # --- 4. Dataset ---
-transform = transforms.Compose([transforms.ToTensor(
-), transforms.Normalize((0.1307,), (0.3081,))])  # MNIST stats
-
-trainset = torchvision.datasets.MNIST(
-    root='./data', train=True, download=True, transform=transform)
-trainloader = DataLoader(trainset, batch_size=BATCH_SIZE, shuffle=True,
-                         num_workers=2, pin_memory=True if DEVICE == 'cuda' else False)
-
-testset = torchvision.datasets.MNIST(
-    root='./data', train=False, download=True, transform=transform)
-testloader = DataLoader(testset, batch_size=BATCH_SIZE, shuffle=False,
-                        num_workers=2, pin_memory=True if DEVICE == 'cuda' else False)
-
+transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))])
+trainset = torchvision.datasets.MNIST(root='./data', train=True, download=True, transform=transform)
+trainloader = DataLoader(trainset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True if DEVICE=='cuda' else False)
+testset = torchvision.datasets.MNIST(root='./data', train=False, download=True, transform=transform)
+testloader = DataLoader(testset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True if DEVICE=='cuda' else False)
 
 # --- 5. Initialization ---
-model = NoPropNet(num_blocks=T, embed_dim=EMBED_DIM, num_classes=NUM_CLASSES,
-                  img_channels=IMG_CHANNELS, img_size=IMG_SIZE).to(DEVICE)
+model = NoPropNet(num_blocks=T, embed_dim=EMBED_DIM, num_classes=NUM_CLASSES, img_channels=IMG_CHANNELS, img_size=IMG_SIZE).to(DEVICE)
 
-# Separate optimizer for each block + one for classifier/embeddings
-optimizers = [optim.AdamW(block.parameters(), lr=LR, weight_decay=1e-3) for block in model.blocks]
+# Optimizers
+optimizers_blocks = [optim.AdamW(block.parameters(), lr=LR, weight_decay=WEIGHT_DECAY) for block in model.blocks]
+params_final_classifier = model.classifier.parameters()
+params_final_embedding = label_embedding.parameters()
+optimizer_final = optim.AdamW([
+    {'params': params_final_classifier, 'weight_decay': WEIGHT_DECAY},
+    {'params': params_final_embedding, 'weight_decay': EMBED_WD}
+], lr=LR)
+print(f"Initialized optimizer_final: Classifier WD={WEIGHT_DECAY}, Embeddings WD={EMBED_WD}.")
 
-optimizer_final = optim.AdamW(list(model.classifier.parameters()) + list(label_embedding.parameters()), lr=LR, weight_decay=1e-3)  # AdamW
-
-mse_loss = nn.MSELoss()
+mse_loss = nn.MSELoss() # Теперь для шума
 ce_loss = nn.CrossEntropyLoss()
 
-
-# --- 6. NOPROP Training Loop ---
-print("Starting NoProp Training...")
-start_time = time.time()
-
-for epoch in range(EPOCHS):
-    model.train()  # Устанавливаем режим обучения
-    running_loss_denoise_total = 0.0
-    running_loss_classify = 0.0
-    processed_samples = 0
-
-    for i, data in enumerate(trainloader, 0):
-        inputs, labels = data
-        inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
-        batch_size = inputs.shape[0]
-
-        # Get target label embeddings u_y
-        u_y = label_embedding(labels) # Requires grad if embedding is learned
-
-        # --- Core NoProp: Train each block independently ---
-        total_denoising_loss_batch = 0.0
-        # According to Eq 56, block t takes z_{t-1} sampled from q(z_{t-1}|y)
-        # According to Algorithm 1, we sample z_t ~ q(z_t|y) and compute loss for block t using z_{t-1}? Ambiguous.
-        # Let's follow Eq 56: Train block 't' (paper index) using z_{t-1} sampled from q(z_{t-1}|y)
-        # Our block index `t_idx` = 0..T-1 corresponds to paper index `t` = 1..T.
-        # So block `t_idx` takes `z_{t_idx}` sampled from `q(z_{t_idx}|y)` as input z_input
-        for t_idx in range(T):
-            # Sample z_t (paper index t = t_idx + 1) from q(z_t | y)
-            epsilon = torch.randn_like(u_y)
-            sqrt_a_bar = torch.sqrt(alphas_bar[t_idx]).view(-1, 1).expand_as(u_y) # Используем alpha_bar_{t-1} (paper)
-            sqrt_1_minus_a_bar = torch.sqrt(1.0 - alphas_bar[t_idx]).view(-1, 1).expand_as(u_y)
-
-            # Это z_{t-1} (paper index) sampled from q(z_{t-1}|y)
-            z_input_for_block = sqrt_a_bar * u_y.detach() + sqrt_1_minus_a_bar * epsilon # Используем detach для u_y здесь тоже
-
-            block_to_train = model.blocks[t_idx]
-            # Блок t (paper, t_idx) получает z_{t-1} (paper)
-            predicted_u_y = block_to_train(inputs, z_input_for_block)
-
-            loss_t = mse_loss(predicted_u_y, u_y.detach()) # Цель - чистый u_y (отсоединенный)
-
-            # Вес для блока t (paper, t_idx) использует SNR(t) - SNR(t-1) (paper)
-            # Это соответствует snr_loss_weight[t_idx]
-            weighted_loss_t = T * ETA_LOSS_WEIGHT * snr_loss_weight[t_idx] * loss_t
-
-
-            total_denoising_loss_batch += weighted_loss_t.item()
-
-            # --- Independent Backpropagation for block t_idx ---
-            optimizers[t_idx].zero_grad()
-            weighted_loss_t.backward()  # Computes gradients ONLY for parameters in block t_idx
-            optimizers[t_idx].step()  # Updates ONLY parameters in block t_idx
-
-        # --- Train Classifier and Embeddings (if learnable) ---
-        # This uses the CrossEntropy term from Eq. 8: E_q(z_T|y)[-log p_theta_out(y|z_T)]
-        # Sample z_T from q(z_T|y)
-        epsilon_final = torch.randn_like(u_y)
-        # Use sqrt_..._train[T-1] which corresponds to paper time T
-        sqrt_a_bar_T = sqrt_alphas_cumprod_train[T -
-                                                 1].view(-1, 1).expand_as(u_y)
-        sqrt_1_minus_a_bar_T = sqrt_one_minus_alphas_cumprod_train[T-1].view(-1, 1).expand_as(
-            u_y)
-        z_T_sample = sqrt_a_bar_T * u_y + sqrt_1_minus_a_bar_T * \
-            epsilon_final  # Detach u_y here?
-
-        # Get classification logits
-        logits = model.classifier(z_T_sample)
-        classify_loss = ce_loss(logits, labels)
-
-        # Backprop for classifier and embeddings
-        optimizer_final.zero_grad()
-        classify_loss.backward()
-        optimizer_final.step()
-
-        # --- Logging ---
-        running_loss_denoise_total += total_denoising_loss_batch
-        running_loss_classify += classify_loss.item()
-        processed_samples += batch_size
-
-        if (i + 1) % 100 == 0:  # Print every 100 mini-batches
-            avg_denoise_loss_print = running_loss_denoise_total / (100 * T)
-            avg_classify_loss_print = running_loss_classify / 100
-            print(f'[Epoch {epoch + 1}/{EPOCHS}, Batch {i + 1:5d}/{len(trainloader)}] AvgDenoiseLoss: {avg_denoise_loss_print:.4f}, ClassifyLoss: {avg_classify_loss_print:.4f}')
-            running_loss_denoise_total = 0.0
-            running_loss_classify = 0.0
-
-    epoch_time = time.time() - start_time
-    print(f"Epoch {epoch + 1} finished. Time elapsed: {epoch_time:.2f}s")
-
-
-print('Finished Training')
-total_training_time = time.time() - start_time
-print(f"Total Training Time: {total_training_time:.2f}s")
-
-
-# --- 7. Inference Function ---
-@torch.no_grad()  # Disable gradient calculations for inference
-def run_inference(model, x_batch, T_steps, a_coeffs, b_coeffs, sqrt_c_coeffs, device):
+# --- 7. Inference Function (ПЕРЕПИСАНА под DDPM-like step с предсказанием epsilon) ---
+# Перемещаем определение ДО цикла обучения
+@torch.no_grad()
+def run_inference(model, x_batch, T_steps, alphas, alphas_bar, posterior_variance, device):
     """
-    Runs the NoProp inference process using Equation 3.
+    Запускает процесс вывода, используя DDPM-подобный шаг с предсказанным шумом epsilon.
     """
     batch_size = x_batch.shape[0]
-    embed_dim = model.embed_dim  # Get embed_dim from model
+    embed_dim = model.embed_dim
 
-    # 1. Start with z_0 ~ N(0, I)
-    z = torch.randn(batch_size, embed_dim, device=device)
+    # 1. Начинаем с z_T ~ N(0, I)
+    # Обратите внимание: в NoProp z_0 был шумом, а z_T - выходом.
+    # В DDPM наоборот: x_T - шум, x_0 - выход.
+    # Сохраним нотацию NoProp где z_0 - шум, z_T - результат T шагов.
+    # Значит, inference должен идти от z_0 к z_T? Нет, по логике DDPM/Sohl-Dickstein
+    # обратный процесс идет от шума (z_T) к данным (z_0).
+    # Давайте следовать DDPM: начинаем с z_T, идем к z_0.
 
-    # 2. Iteratively apply blocks using Equation 3
-    for t in range(T_steps):  # Loop t from 0 to T-1 (corresponds to steps t=1 to T)
-        # model.blocks[t] corresponds to u_hat_theta_{t+1} in paper index
-        # Input to block t (paper t+1) is z_t (paper t)
-        u_hat = model.blocks[t](x_batch, z)  # Pass current state z
+    z = torch.randn(batch_size, embed_dim, device=device) # z_T (чистый шум)
 
-        # Get coefficients for this step t (index t)
-        # Coeffs are indexed 0..T-1, corresponding to step t=1..T
-        a_t = a_coeffs[t]
-        b_t = b_coeffs[t]
-        sqrt_c_t = sqrt_c_coeffs[t]
+    # 2. Итеративно идем назад от T до 1
+    for t_idx_rev in range(T_steps - 1, -1, -1): # t_idx_rev = T-1, T-2, ..., 0
+        # Это соответствует времени t = T, T-1, ..., 1 в DDPM
+        current_t_paper = t_idx_rev + 1
+        block_to_use = model.blocks[t_idx_rev] # Блок t_idx предсказывает шум для шага t=t_idx+1
 
-        # Sample noise epsilon_t ~ N(0, I)
-        epsilon_t = torch.randn_like(z)
-        # if t == T_steps - 1: # Option: No noise on the last step?
-        #    epsilon_t.zero_()
+        # Вход для блока DDPM - это z_t (текущее состояние)
+        # Нам нужно передать и время/уровень шума? В VDM передают gamma_t.
+        # В текущей архитектуре DenoisingBlockPaper нет входа для времени.
+        # Это может быть проблемой! Блок не знает, для какого шага предсказывать шум.
+        # Пока проигнорируем, но это важное ограничение.
+        predicted_epsilon = block_to_use(x_batch, z) # Передаем текущий z (z_t)
 
-        # Apply Equation 3: z_{t+1} = a_{t+1} * u_hat_{t+1} + b_{t+1} * z_t + sqrt(c_{t+1}) * epsilon_{t+1}
-        # Our t is index 0..T-1, z is z_t (paper index), coeffs[t] are for step t+1 (paper index)
-        z = a_t * u_hat + b_t * z + sqrt_c_t * epsilon_t  # z becomes z_{t+1}
+        alpha_t = alphas[t_idx_rev]             # alpha_t = alpha_{t_idx+1}
+        alpha_bar_t = alphas_bar[t_idx_rev + 1] # alpha_bar_t = alpha_bar_{t_idx+1}
+        beta_t = 1.0 - alpha_t                  # beta_t = beta_{t_idx+1}
+        sqrt_recip_alpha_t = 1.0 / torch.sqrt(alpha_t)
+        sqrt_1m_alpha_bar_t = torch.sqrt(1.0 - alpha_bar_t)
 
-    # 3. After T steps, z represents z_T. Use the classifier.
+        # DDPM reverse step:
+        # z_{t-1} = 1/sqrt(alpha_t) * (z_t - beta_t / sqrt(1-alpha_bar_t) * predicted_epsilon) + sigma_t * noise
+        mean = sqrt_recip_alpha_t * (z - beta_t / sqrt_1m_alpha_bar_t * predicted_epsilon)
+
+        if t_idx_rev == 0: # Последний шаг (t=1 -> t=0)
+            noise = torch.zeros_like(z)
+            # ИСПРАВЛЕНИЕ: Устанавливаем нулевой тензор вместо float
+            variance = torch.tensor(0.0, device=device)
+        else:
+            noise = torch.randn_like(z)
+            # Убедимся, что posterior_variance - это тензор
+            variance = posterior_variance[t_idx_rev] # variance остается тензором
+
+        # Также добавим clamp для гарантии неотрицательности перед корнем
+        variance_stable = torch.clamp(variance + 1e-6, min=0.0)
+
+        z = mean + torch.sqrt(variance_stable + 1e-6) * noise # Добавим epsilon для стабильности корня
+
+    # 3. После T шагов, z представляет z_0 (предсказанный чистый эмбеддинг)
+    # Используем классификатор на z_0
     logits = model.classifier(z)
-
     return logits
 
+# --- 6. NOPROP Training Loop (Цель: шум epsilon, Классификатор: на предсказанном u_hat_T) ---
+print(f"Starting NoProp Training for {EPOCHS} epochs...")
+total_start_time = time.time()
 
-# --- 8. Evaluation after Training ---
-print("\nRunning evaluation using inference process...")
-eval_start_time = time.time()
+best_test_accuracy = 0.0
+epochs_no_improve = 0
+patience = 15
 
-correct = 0
-total = 0
-model.eval()  # Set model to evaluation mode
+for epoch in range(EPOCHS):
+    model.train()
+    epoch_start_time = time.time()
+    print(f"--- Starting Epoch {epoch + 1}/{EPOCHS} ---")
 
-with torch.no_grad():
-    for data in testloader:
-        images, labels = data
-        images, labels = images.to(DEVICE), labels.to(DEVICE)
+    # Внешний цикл по временному шагу t
+    for t_idx in range(T): # t_idx = 0..T-1 соответствует шагу t=1..T статьи
+        block_to_train = model.blocks[t_idx]
+        optimizer_t = optimizers_blocks[t_idx]
 
-        # Run inference process
-        logits = run_inference(model, images, T, a_coeffs,
-                               b_coeffs, sqrt_c_coeffs, DEVICE)
+        running_loss_denoise_t = 0.0
+        running_loss_classify_t = 0.0
+        processed_batches_t = 0
+        block_start_time = time.time()
 
-        # Get predictions
-        _, predicted = torch.max(logits.data, 1)
-        total += labels.size(0)
-        correct += (predicted == labels).sum().item()
+        # Внутренний цикл по мини-батчам
+        for i, data in enumerate(trainloader, 0):
+            inputs, labels = data
+            inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+            batch_size = inputs.shape[0]
 
-accuracy = 100 * correct / total
-eval_time = time.time() - eval_start_time
-print(
-    f'Accuracy on the {total} test images using NoProp inference: {accuracy:.2f} %')
-print(f"Evaluation Time: {eval_time:.2f}s")
+            u_y = label_embedding(labels)
+            # current_W_embed больше не нужен блокам напрямую
 
-# model.train() # Optional: return to training mode if needed later
+            # --- Denoising Loss (Цель: шум epsilon) ---
+            # 1. Сэмплируем epsilon
+            epsilon_target = torch.randn_like(u_y)
+
+            # 2. Сэмплируем z_{t-1} ~ q(z_{t-1} | y) используя epsilon_target
+            # alpha_bar_{t-1} статьи соответствует alphas_bar[t_idx] кода
+            alpha_bar_for_sample = alphas_bar[t_idx]
+            sqrt_a_bar = sqrt_alphas_bar[t_idx].view(-1, 1).expand_as(u_y) # Используем предвычисленные
+            sqrt_1_minus_a_bar = sqrt_one_minus_alphas_bar[t_idx].view(-1, 1).expand_as(u_y)
+            # Вход для блока t_idx (предсказывает epsilon для шага t=t_idx+1)
+            # Должен ли вход быть z_{t-1} или z_t?
+            # Стандартный DDPM: epsilon_theta(z_t, t) предсказывает epsilon, который был добавлен для получения z_t
+            # NoProp: блок t работает с z_{t-1} (исходная идея).
+            # Давайте пока оставим вход z_{t-1}, как было раньше в NoProp.
+            z_input_for_block = sqrt_a_bar * u_y.detach() + sqrt_1_minus_a_bar * epsilon_target
+
+            # 3. Предсказываем epsilon с помощью блока t_idx
+            # Убрали current_W_embed из вызова
+            predicted_epsilon = block_to_train(inputs, z_input_for_block)
+
+            # 4. Вычисляем потери MSE между предсказанным и реальным шумом
+            loss_t = mse_loss(predicted_epsilon, epsilon_target)
+            running_loss_denoise_t += loss_t.item() # Логируем невзвешенные
+
+            # Используем равномерный вес (контролируемый ETA, который сейчас 1.0)
+            weighted_loss_t = ETA_LOSS_WEIGHT * loss_t
+
+            # --- Classification Loss (на основе предсказанного u_hat_T) ---
+            # Для этого нужен z_{T-1} и предсказание шума epsilon_T от блока T-1
+            with torch.no_grad():
+                # Сэмплируем z_{T-1}
+                alpha_bar_T_minus_1 = alphas_bar[T-1]
+                sqrt_a_bar_Tm1 = sqrt_alphas_bar[T-1].view(-1, 1).expand_as(u_y)
+                sqrt_1_minus_a_bar_Tm1 = sqrt_one_minus_alphas_bar[T-1].view(-1, 1).expand_as(u_y)
+                epsilon_Tm1_target = torch.randn_like(u_y) # Шум для T-1
+                z_T_minus_1_sample = sqrt_a_bar_Tm1 * u_y.detach() + sqrt_1_minus_a_bar_Tm1 * epsilon_Tm1_target
+
+                # Получаем предсказание шума epsilon_T от последнего блока
+                # Убрали current_W_embed
+                predicted_epsilon_T = model.blocks[T-1](inputs, z_T_minus_1_sample)
+
+                # Восстанавливаем предсказанный чистый u_hat_T
+                # Используем формулу x_0 = (x_t - sqrt(1-alpha_bar_t)*epsilon) / sqrt(alpha_bar_t)
+                # Здесь x_t это z_{T-1}, t это T-1
+                predicted_u_y_final = (z_T_minus_1_sample - sqrt_1_minus_a_bar_Tm1 * predicted_epsilon_T) / (sqrt_a_bar_Tm1 + 1e-6) # Добавим epsilon
+
+            # Классификатор на предсказанном чистом эмбеддинге (с detach)
+            logits = model.classifier(predicted_u_y_final.detach())
+            classify_loss = ce_loss(logits, labels)
+            running_loss_classify_t += classify_loss.item()
+
+            # --- Обновление параметров (Объединенное) ---
+            # Вернемся к объединенному обновлению как в Алгоритме 1
+            total_loss_batch = weighted_loss_t + classify_loss
+
+            optimizer_t.zero_grad()
+            optimizer_final.zero_grad()
+
+            total_loss_batch.backward() # Градиенты от обеих потерь
+
+            # Клиппинг градиентов
+            torch.nn.utils.clip_grad_norm_(block_to_train.parameters(), max_norm=GRAD_CLIP_MAX_NORM)
+            torch.nn.utils.clip_grad_norm_(model.classifier.parameters(), max_norm=GRAD_CLIP_MAX_NORM)
+            if label_embedding.weight.requires_grad:
+                torch.nn.utils.clip_grad_norm_(label_embedding.parameters(), max_norm=GRAD_CLIP_MAX_NORM)
+
+            # Шаг оптимизаторов
+            optimizer_t.step()
+            optimizer_final.step()
+
+            # Клиппинг нормы эмбеддингов
+            with torch.no_grad():
+                current_norm = label_embedding.weight.data.norm()
+                if current_norm > MAX_NORM_EMBED:
+                    label_embedding.weight.data.mul_(MAX_NORM_EMBED / (current_norm + 1e-6))
+
+            processed_batches_t += 1
+            # ... (конец цикла по батчам) ...
+
+        # Логирование после блока t_idx
+        block_time = time.time() - block_start_time
+        avg_denoise_loss_block = running_loss_denoise_t / processed_batches_t
+        avg_classify_loss_block = running_loss_classify_t / processed_batches_t
+        print(f'  Epoch {epoch + 1}, Block {t_idx + 1}/{T} trained. AvgLoss: Denoise(MSE_eps)={avg_denoise_loss_block:.7f}, Classify={avg_classify_loss_block:.4f}. Time: {block_time:.2f}s')
+        # ... (конец цикла по t_idx) ...
+
+    # --- Конец Эпохи Обучения ---
+    epoch_time = time.time() - epoch_start_time
+    with torch.no_grad():
+        embedding_norm = torch.norm(label_embedding.weight.data)
+        print(f"--- Epoch {epoch + 1} finished. Training Time: {epoch_time:.2f}s ---")
+        print(f"--- End of Epoch {epoch + 1}. Embedding Norm: {embedding_norm:.4f} ---")
+
+    # --- ОЦЕНКА ПОСЛЕ КАЖДОЙ ЭПОХИ ---
+    print(f"--- Running Evaluation for Epoch {epoch + 1} ---")
+    eval_start_time = time.time()
+    correct = 0
+    total = 0
+    model.eval()
+
+    final_W_embed = label_embedding.weight.data.detach() # Не используется в инференсе теперь
+
+    with torch.no_grad():
+        for data in testloader:
+            images, labels = data
+            images, labels = images.to(DEVICE), labels.to(DEVICE)
+            # ИЗМЕНЕНИЕ: Вызов нового инференса
+            logits = run_inference(model, images, T, alphas, alphas_bar, posterior_variance, DEVICE)
+            _, predicted = torch.max(logits.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+
+    current_test_accuracy = 100 * correct / total
+    eval_time = time.time() - eval_start_time
+    print(f'>>> Epoch {epoch + 1} Test Accuracy: {current_test_accuracy:.2f} % ({correct}/{total}) <<<')
+    print(f"Evaluation Time: {eval_time:.2f}s")
+
+    # Логика ранней остановки
+    if current_test_accuracy > best_test_accuracy:
+        best_test_accuracy = current_test_accuracy
+        epochs_no_improve = 0
+        print(f"*** New best test accuracy: {best_test_accuracy:.2f} % ***")
+    else:
+        epochs_no_improve += 1
+        print(f"Test accuracy did not improve for {epochs_no_improve} epochs.")
+
+    if epochs_no_improve >= patience:
+        print(f"Stopping early after {epoch + 1} epochs due to no improvement in test accuracy for {patience} epochs.")
+        break
+
+# --- Конец всего обучения ---
+print('Finished Training')
+total_training_time = time.time() - total_start_time
+print(f"Total Training Time: {total_training_time:.2f}s")
