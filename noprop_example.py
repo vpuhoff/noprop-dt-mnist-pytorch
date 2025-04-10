@@ -10,6 +10,8 @@ import time
 from typing import Dict, Tuple, List, Any
 import optuna # Добавляем импорт Optuna
 from optuna.samplers import GridSampler # Для поиска по сетке
+import plotly 
+import kaleido  # для экспорта, если понадобится
 
 # --- 1. Базовая Конфигурация (Значения по умолчанию и не тюнингуемые) ---
 # Эти значения будут использоваться, если Optuna их не переопределит
@@ -410,6 +412,19 @@ def objective(trial: optuna.trial.Trial) -> float:
     print(f"--- Trial {trial.number} Finished. Best Acc in {run_config['EPOCHS']} epochs: {best_trial_accuracy:.2f}% ---")
     return best_trial_accuracy
 
+def write_plots(study):
+    #You can visualize results if needed (requires pip install optuna-dashboard or plotly)
+    try:
+        fig1 = optuna.visualization.plot_optimization_history(study)
+        #fig1.show(renderer="browser")  # откроется в браузере
+        fig1.write_image("opt_history.png")
+        fig2 = optuna.visualization.plot_param_importances(study)
+        #fig2.show(renderer="browser")
+        fig2.write_image("param_importance.png")
+    except ImportError:
+        print("\nInstall plotly and kaleido to visualize Optuna results: pip install plotly kaleido")
+    except Exception as e_vis:
+        print(f"Could not plot Optuna results: {e_vis}")
 
 # --- Main Execution Block for HPO ---
 if __name__ == "__main__":
@@ -426,14 +441,22 @@ if __name__ == "__main__":
         direction='maximize',
         sampler=optuna.samplers.GridSampler(search_space),
         # Optional: Add pruning to stop bad trials early
-        pruner=optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=4, interval_steps=1) # Prune after epoch 4 if worse than median
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=4, interval_steps=1), # Prune after epoch 4 if worse than median,
+        storage="sqlite:///optuna_results.db",
+        load_if_exists=True,
     )
 
     # Run the hyperparameter optimization
     print(f"\nStarting HPO Grid Search with {n_trials} trials ({base_config['EPOCHS']} epochs each)...")
     start_hpo_time = time.time()
     try:
-        study.optimize(objective, n_trials=n_trials, timeout=7200) # Added 2-hour timeout
+        try:
+            study.optimize(objective, n_trials=n_trials, timeout=60*60*24) # Added 24-hour timeout
+        except KeyboardInterrupt:
+            print("Прерывание: сохраняю текущий прогресс Optuna...")
+            print(f"Проведено итераций: {len(study.trials)}")
+            print("Лучшие параметры на текущий момент:", study.best_params)
+            write_plots(study)
     except Exception as e:
         print(f"An error occurred during HPO: {e}")
     finally:
@@ -454,20 +477,3 @@ if __name__ == "__main__":
     else:
         print("No successful trials completed.")
 
-    #You can visualize results if needed (requires pip install optuna-dashboard or plotly)
-    try:
-        import plotly
-        import kaleido  # для экспорта, если понадобится
-
-        fig1 = optuna.visualization.plot_optimization_history(study)
-        #fig1.show(renderer="browser")  # откроется в браузере
-        fig1.write_image("opt_history.png")
-
-        fig2 = optuna.visualization.plot_param_importances(study)
-        #fig2.show(renderer="browser")
-        fig2.write_image("param_importance.png")
-
-    except ImportError:
-        print("\nInstall plotly and kaleido to visualize Optuna results: pip install plotly kaleido")
-    except Exception as e_vis:
-        print(f"Could not plot Optuna results: {e_vis}")

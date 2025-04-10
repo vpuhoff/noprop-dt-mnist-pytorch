@@ -1,2 +1,3 @@
 noprop_env
 data/*
+optuna_results.db
