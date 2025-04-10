@@ -16,7 +16,7 @@ IMG_SIZE = 28
 IMG_CHANNELS = 1
 BATCH_SIZE = 128
 EPOCHS = 100
-LR = 1e-4 # Оставим пониженный LR
+LR = 1e-2 # Оставим пониженный LR
 WEIGHT_DECAY = 1e-3 # WD для блоков и классификатора
 EMBED_WD = 1e-5 # Маленький WD для эмбеддингов
 MAX_NORM_EMBED = 50.0 # Порог для клиппинга нормы эмбеддингов
@@ -156,6 +156,13 @@ optimizer_final = optim.AdamW([
     {'params': params_final_embedding, 'weight_decay': EMBED_WD}
 ], lr=LR)
 print(f"Initialized optimizer_final: Classifier WD={WEIGHT_DECAY}, Embeddings WD={EMBED_WD}.")
+
+T_max_epochs = EPOCHS # Количество эпох для одного цикла косинуса (можно взять меньше, если планируется ранняя остановка)
+eta_min_lr = 1e-6 # Минимальное значение LR
+
+schedulers_blocks = [optim.lr_scheduler.CosineAnnealingLR(opt, T_max=T_max_epochs, eta_min=eta_min_lr) for opt in optimizers_blocks]
+scheduler_final = optim.lr_scheduler.CosineAnnealingLR(optimizer_final, T_max=T_max_epochs, eta_min=eta_min_lr)
+
 
 mse_loss = nn.MSELoss() # Теперь для шума
 ce_loss = nn.CrossEntropyLoss()
@@ -346,6 +353,15 @@ for epoch in range(EPOCHS):
         embedding_norm = torch.norm(label_embedding.weight.data)
         print(f"--- Epoch {epoch + 1} finished. Training Time: {epoch_time:.2f}s ---")
         print(f"--- End of Epoch {epoch + 1}. Embedding Norm: {embedding_norm:.4f} ---")
+
+    # Шаг планировщиков
+    for scheduler in schedulers_blocks:
+        scheduler.step()
+    scheduler_final.step()
+
+    # Выводим текущий LR
+    current_lr = optimizer_final.param_groups[0]['lr']
+    print(f"--- End of Epoch {epoch + 1}. Current LR: {current_lr:.6f} ---")
 
     # --- ОЦЕНКА ПОСЛЕ КАЖДОЙ ЭПОХИ ---
     print(f"--- Running Evaluation for Epoch {epoch + 1} ---")
