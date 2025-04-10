@@ -12,6 +12,7 @@ import optuna # Добавляем импорт Optuna
 from optuna.samplers import GridSampler # Для поиска по сетке
 import plotly 
 import kaleido  # для экспорта, если понадобится
+from tqdm import tqdm
 
 # --- 1. Базовая Конфигурация (Значения по умолчанию и не тюнингуемые) ---
 # Эти значения будут использоваться, если Optuna их не переопределит
@@ -50,6 +51,10 @@ base_config: Dict[str, Any] = {
 }
 
 # --- 2. Helper Functions (Без изменений) ---
+progress_bar = None
+
+def tqdm_callback(study, trial):
+    progress_bar.update(1)
 
 def get_alpha_bar_schedule(timesteps: int, s: float = 0.008) -> torch.Tensor:
     steps = timesteps + 1
@@ -426,6 +431,7 @@ def write_plots(study):
     except Exception as e_vis:
         print(f"Could not plot Optuna results: {e_vis}")
 
+
 # --- Main Execution Block for HPO ---
 if __name__ == "__main__":
     # Define the grid search space for Optuna
@@ -436,8 +442,10 @@ if __name__ == "__main__":
     }
     n_trials = len(search_space['LR']) * len(search_space['ETA_LOSS_WEIGHT']) * len(search_space['EMBED_WD']) # 3x3x3 = 27
 
+    
     # Create the Optuna study with GridSampler
     study = optuna.create_study(
+        study_name="find_params",
         direction='maximize',
         sampler=optuna.samplers.GridSampler(search_space),
         # Optional: Add pruning to stop bad trials early
@@ -445,6 +453,8 @@ if __name__ == "__main__":
         storage="sqlite:///optuna_results.db",
         load_if_exists=True,
     )
+
+    progress_bar = tqdm(total=n_trials, initial=len(study.trials))
 
     # Run the hyperparameter optimization
     print(f"\nStarting HPO Grid Search with {n_trials} trials ({base_config['EPOCHS']} epochs each)...")
