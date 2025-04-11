@@ -42,7 +42,7 @@ The goal of NoProp is to train neural networks without relying on traditional en
 * **Stabilization:** Used **gradient clipping** (`max_norm=1.0`).
 * **Epochs:** Trained for 100 epochs with per-epoch test evaluation and early stopping potential.
 
-## Current Status & Experimental Results *(Updated Apr 10, 2025)*
+## Current Status & Experimental Results *(Updated Apr 11, 2025)*
 
 After numerous debugging iterations and **significant modifications to the original NoProp algorithm** (including changing the prediction target to noise $\epsilon$ and altering the classifier input to $\hat{u}_T$), a **stable training process was achieved**.
 
@@ -50,9 +50,9 @@ After numerous debugging iterations and **significant modifications to the origi
     * Training `Classify Loss` decreased steadily and significantly (reaching values < 0.1).
     * Training `AvgDenoiseLoss` (MSE on noise $\epsilon$) remained non-zero throughout training.
     * Embedding norm was successfully controlled via clipping.
-* **Final Test Accuracy (MNIST):** The model achieved a test accuracy of approximately **XX.XX%** *(Replace XX.XX% with the best test accuracy achieved during the full training run)*.
+* **Final Test Accuracy (MNIST):** The model achieved a test accuracy of approximately **82.73%%** *('LR': 0.01, 'ETA_LOSS_WEIGHT': 0.5, 'EMBED_WD': 1e-05)*.
 
-*Intermediate Debugging Result:* At epoch 10, test accuracy reached **~39%**, demonstrating the viability of the modified approach.
+*Intermediate Debugging Result:* At epoch 20, test accuracy reached **~82.73%**, demonstrating the viability of the modified approach.
 
 ## Conclusions from Experiments
 

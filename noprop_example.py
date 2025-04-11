@@ -50,6 +50,11 @@ base_config: Dict[str, Any] = {
     "num_workers": 2,
 }
 
+STUDY_NAME = "find_params_v4"
+LR_TRIALS = [5e-2, 1e-2, 2e-3]
+ETA_LOSS_WEIGHT_TRIALS = [0.5, 1.0, 1.5]
+EMBED_WD_TRIALS = [1e-5, 1e-6, 1e-7]
+
 # --- 2. Helper Functions (Без изменений) ---
 progress_bar = None
 
@@ -370,11 +375,11 @@ def objective(trial: optuna.trial.Trial) -> float:
     run_config = base_config.copy()
 
     # --- Hyperparameters to tune ---
-    run_config['LR'] = trial.suggest_categorical('LR', [5e-4, 1e-3, 2e-3])
-    run_config['ETA_LOSS_WEIGHT'] = trial.suggest_categorical('ETA_LOSS_WEIGHT', [0.1, 1.0, 10.0])
-    run_config['EMBED_WD'] = trial.suggest_categorical('EMBED_WD', [0.0, 1e-5, 1e-4])
+    run_config['LR'] = trial.suggest_categorical('LR', LR_TRIALS)
+    run_config['ETA_LOSS_WEIGHT'] = trial.suggest_categorical('ETA_LOSS_WEIGHT', ETA_LOSS_WEIGHT_TRIALS)
+    run_config['EMBED_WD'] = trial.suggest_categorical('EMBED_WD', EMBED_WD_TRIALS)
     # --- Fixed parameters for HPO ---
-    run_config['EPOCHS'] = 10 # Short run for HPO
+    run_config['EPOCHS'] = 20 # Short run for HPO
 
     print(f"\n--- Starting Optuna Trial {trial.number} with config: ---")
     print(f"LR: {run_config['LR']:.1e}, ETA: {run_config['ETA_LOSS_WEIGHT']:.1f}, EmbedWD: {run_config['EMBED_WD']:.1e}")
@@ -436,16 +441,16 @@ def write_plots(study):
 if __name__ == "__main__":
     # Define the grid search space for Optuna
     search_space = {
-         'LR': [5e-4, 1e-3, 2e-3],
-         'ETA_LOSS_WEIGHT': [0.1, 1.0, 10.0],
-         'EMBED_WD': [0.0, 1e-5, 1e-4]
+         'LR': LR_TRIALS,
+         'ETA_LOSS_WEIGHT': ETA_LOSS_WEIGHT_TRIALS,
+         'EMBED_WD': EMBED_WD_TRIALS
     }
     n_trials = len(search_space['LR']) * len(search_space['ETA_LOSS_WEIGHT']) * len(search_space['EMBED_WD']) # 3x3x3 = 27
 
     
     # Create the Optuna study with GridSampler
     study = optuna.create_study(
-        study_name="find_params",
+        study_name=STUDY_NAME,
         direction='maximize',
         sampler=optuna.samplers.GridSampler(search_space),
         # Optional: Add pruning to stop bad trials early
@@ -461,7 +466,7 @@ if __name__ == "__main__":
     start_hpo_time = time.time()
     try:
         try:
-            study.optimize(objective, n_trials=n_trials, timeout=60*60*24) # Added 24-hour timeout
+            study.optimize(objective, n_trials=n_trials, timeout=60*60*24, callbacks=[tqdm_callback]) # Added 24-hour timeout
         except KeyboardInterrupt:
             print("Прерывание: сохраняю текущий прогресс Optuna...")
             print(f"Проведено итераций: {len(study.trials)}")
@@ -483,7 +488,7 @@ if __name__ == "__main__":
             print(f"  {key}: {value}")
 
         print("\n--- Recommendations ---")
-        print(f"Use these 'Best hyperparameters' for a full training run (e.g., {base_config['T_max_epochs']} epochs) with the LR scheduler enabled.")
+        print(f"Use these 'Best hyperparameters' for a full training run with the LR scheduler enabled.")
     else:
         print("No successful trials completed.")
 
