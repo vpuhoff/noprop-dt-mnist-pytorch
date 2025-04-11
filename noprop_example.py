@@ -436,59 +436,167 @@ def write_plots(study):
     except Exception as e_vis:
         print(f"Could not plot Optuna results: {e_vis}")
 
+def run_full_training(config: Dict[str, Any]):
+    """Запускает полный цикл обучения с заданными параметрами, планировщиком и ранней остановкой."""
+    DEVICE = config['DEVICE']
+    print("--- Running Full Training ---")
+    print(f"Using device: {DEVICE}")
+    print(f"Configuration: {config}")
 
-# --- Main Execution Block for HPO ---
+    # 1. Precompute diffusion coefficients
+    diff_coeffs = precompute_diffusion_coefficients(config['T'], DEVICE, config['s_noise_schedule'])
+
+    # 2. Initialize Embeddings
+    label_embedding = initialize_embeddings(config['NUM_CLASSES'], config['EMBED_DIM'], DEVICE)
+
+    # 3. Initialize Model
+    model = NoPropNet(
+        num_blocks=config['T'], embed_dim=config['EMBED_DIM'], num_classes=config['NUM_CLASSES'],
+        img_channels=config['IMG_CHANNELS'], img_size=config['IMG_SIZE']
+    ).to(DEVICE)
+
+    # 4. Get Dataloaders
+    pin_memory = True if DEVICE == torch.device('cuda') else False
+    trainloader, testloader = get_dataloaders(config['BATCH_SIZE'], config['data_root'], config['num_workers'], pin_memory)
+
+    # 5. Initialize Training Components - ВКЛЮЧАЯ ПЛАНИРОВЩИК
+    optimizers_blocks, optimizer_final, schedulers_blocks, scheduler_final, mse_loss, ce_loss = \
+        initialize_training_components(model, label_embedding, config, use_scheduler=True) # <--- use_scheduler=True
+
+    # 6. Training Loop
+    print(f"\n--- Starting Full Training for {config['EPOCHS']} epochs ---")
+    total_start_time = time.time()
+    best_test_accuracy = 0.0
+    epochs_no_improve = 0
+
+    for epoch in range(config['EPOCHS']):
+        print(f"\n--- Starting Epoch {epoch + 1}/{config['EPOCHS']} ---")
+        epoch_start_time = time.time()
+
+        # Запускаем обучение на одну эпоху
+        train_epoch(epoch, model, label_embedding, trainloader, optimizers_blocks, optimizer_final,
+                    mse_loss, ce_loss, diff_coeffs, config) # train_epoch остается той же
+
+        epoch_time = time.time() - epoch_start_time
+        with torch.no_grad():
+            embedding_norm = torch.norm(label_embedding.weight.data)
+        print(f"--- Epoch {epoch + 1} finished. Training Time: {epoch_time:.2f}s ---")
+        print(f"--- End of Epoch {epoch + 1}. Embedding Norm: {embedding_norm:.4f} ---")
+
+        # Шаг планировщиков LR
+        current_lr = optimizer_final.param_groups[0]['lr'] # Get LR before stepping scheduler
+        print(f"--- End of Epoch {epoch + 1}. LR before step: {current_lr:.6f} ---")
+        if scheduler_final: # Проверяем, что планировщик был создан
+            for scheduler in schedulers_blocks:
+                scheduler.step()
+            scheduler_final.step()
+            current_lr_after = optimizer_final.param_groups[0]['lr'] # Get LR after stepping scheduler
+            print(f"--- End of Epoch {epoch + 1}. LR after step: {current_lr_after:.6f} ---")
+        else:
+            print("--- End of Epoch {epoch + 1}. LR Scheduler was not used. ---")
+
+
+        # Оценка после каждой эпохи
+        print(f"--- Running Evaluation for Epoch {epoch + 1} ---")
+        eval_start_time = time.time()
+        current_test_accuracy, correct, total = evaluate_model(
+            model, testloader, config['T'], diff_coeffs, DEVICE
+        )
+        eval_time = time.time() - eval_start_time
+        print(f'>>> Epoch {epoch + 1} Test Accuracy: {current_test_accuracy:.2f} % ({correct}/{total}) <<<')
+        print(f"Evaluation Time: {eval_time:.2f}s")
+
+        # Логика Ранней Остановки
+        if current_test_accuracy > best_test_accuracy:
+            best_test_accuracy = current_test_accuracy
+            epochs_no_improve = 0
+            print(f"*** New best test accuracy: {best_test_accuracy:.2f} % ***")
+            # Можно сохранить лучшую модель здесь
+            #torch.save(model, 'best_model_full_run.pth')
+        else:
+            epochs_no_improve += 1
+            print(f"Test accuracy did not improve for {epochs_no_improve} epochs.")
+
+        if epochs_no_improve >= config['patience']:
+            print(f"\nStopping early after {epoch + 1} epochs due to no improvement for {config['patience']} epochs.")
+            print(f"Best test accuracy achieved: {best_test_accuracy:.2f} %")
+            break # Выход из цикла по эпохам
+        # --- Конец цикла по эпохам ---
+
+    # 7. Конец обучения
+    print('\nFinished Full Training')
+    total_training_time = time.time() - total_start_time
+    print(f"Total Training Time: {total_training_time:.2f}s")
+    print(f"Final Best Test Accuracy during run: {best_test_accuracy:.2f} %")
+
+# --- Основной блок ---
 if __name__ == "__main__":
-    # Define the grid search space for Optuna
-    search_space = {
-         'LR': LR_TRIALS,
-         'ETA_LOSS_WEIGHT': ETA_LOSS_WEIGHT_TRIALS,
-         'EMBED_WD': EMBED_WD_TRIALS
-    }
-    n_trials = len(search_space['LR']) * len(search_space['ETA_LOSS_WEIGHT']) * len(search_space['EMBED_WD']) # 3x3x3 = 27
 
-    
-    # Create the Optuna study with GridSampler
-    study = optuna.create_study(
-        study_name=STUDY_NAME,
-        direction='maximize',
-        sampler=optuna.samplers.GridSampler(search_space),
-        # Optional: Add pruning to stop bad trials early
-        pruner=optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=4, interval_steps=1), # Prune after epoch 4 if worse than median,
-        storage="sqlite:///optuna_results.db",
-        load_if_exists=True,
-    )
+    RUN_HPO = False # Установите True для запуска Optuna, False для полного обучения
 
-    progress_bar = tqdm(total=n_trials, initial=len(study.trials))
+    if RUN_HPO:
+        print("--- Starting Hyperparameter Optimization using Optuna ---")
+        search_space = {
+             'LR': LR_TRIALS, 
+             'ETA_LOSS_WEIGHT': ETA_LOSS_WEIGHT_TRIALS,
+             'EMBED_WD': EMBED_WD_TRIALS
+        }
+        n_trials = len(search_space['LR']) * len(search_space['ETA_LOSS_WEIGHT']) * len(search_space['EMBED_WD'])
 
-    # Run the hyperparameter optimization
-    print(f"\nStarting HPO Grid Search with {n_trials} trials ({base_config['EPOCHS']} epochs each)...")
-    start_hpo_time = time.time()
-    try:
+        study = optuna.create_study(
+            study_name=STUDY_NAME, 
+            direction='maximize',
+            sampler=optuna.samplers.GridSampler(search_space),
+            pruner=optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=4, interval_steps=1),
+            storage="sqlite:///optuna_results.db", 
+            load_if_exists=True,
+        )
+
+        progress_bar = tqdm(total=n_trials, initial=len(study.trials))
+        print(f"\nStarting HPO Grid Search with {n_trials} trials ({base_config['EPOCHS']} epochs each)...")
+        start_hpo_time = time.time()
         try:
-            study.optimize(objective, n_trials=n_trials, timeout=60*60*24, callbacks=[tqdm_callback]) # Added 24-hour timeout
+            study.optimize(objective, n_trials=n_trials, timeout=60*60*24, callbacks=[tqdm_callback]) # Используем objective
         except KeyboardInterrupt:
+            print("Прерывание: сохраняю текущий прогресс Optuna...")
             print("Прерывание: сохраняю текущий прогресс Optuna...")
             print(f"Проведено итераций: {len(study.trials)}")
             print("Лучшие параметры на текущий момент:", study.best_params)
             write_plots(study)
-    except Exception as e:
-        print(f"An error occurred during HPO: {e}")
-    finally:
-        end_hpo_time = time.time()
-        print(f"Total HPO time: {end_hpo_time - start_hpo_time:.2f}s")
+        except Exception as e:
+             print(f"An error occurred during HPO: {e}")
+        finally:
+             end_hpo_time = time.time()
+             print(f"Total HPO time: {end_hpo_time - start_hpo_time:.2f}s")
+             progress_bar.close()
 
-    # Print the results
-    print("\n--- HPO Finished ---")
-    if study.best_trial:
-        print(f"Best trial number: {study.best_trial.number}")
-        print(f"Best accuracy (in {base_config['EPOCHS']} epochs): {study.best_value:.2f}%")
-        print("Best hyperparameters found:")
-        for key, value in study.best_params.items():
-            print(f"  {key}: {value}")
-
-        print("\n--- Recommendations ---")
-        print(f"Use these 'Best hyperparameters' for a full training run with the LR scheduler enabled.")
+        # Вывод результатов HPO
+        print("\n--- HPO Finished ---")
+        if study.best_trial:
+            print(f"Best trial number: {study.best_trial.number}")
+            print(f"Best accuracy (in {base_config['EPOCHS']} epochs): {study.best_value:.2f}%")
+            print("Best hyperparameters found:")
+            for key, value in study.best_params.items():
+                print(f"  {key}: {value}")
+            print("\n--- Recommendations ---")
+            print(f"Use these 'Best hyperparameters' for a full training run...")
+        else:
+            print("No successful HPO trials completed.")
+        write_plots(study) # Функция для отрисовки графиков Optuna
     else:
-        print("No successful trials completed.")
+        print("--- Starting Full Training Run with Best Found/Selected Config ---")
+        # Устанавливаем лучшие найденные параметры
+        best_hpo_config = base_config.copy()
+        best_hpo_config['LR'] = 0.01 # Из вашего HPO результата
+        best_hpo_config['ETA_LOSS_WEIGHT'] = 0.5 # Из вашего HPO результата
+        best_hpo_config['EMBED_WD'] = 1e-07 # Из вашего HPO результата
+
+        # Устанавливаем параметры для полного прогона
+        best_hpo_config['EPOCHS'] = 100
+        best_hpo_config['T_max_epochs'] = 100 # Для планировщика LR
+        best_hpo_config['eta_min_lr'] = 1e-6 # Для планировщика LR
+        best_hpo_config['patience'] = 15    # Для ранней остановки
+
+        # Запускаем полный прогон
+        run_full_training(best_hpo_config)
 
