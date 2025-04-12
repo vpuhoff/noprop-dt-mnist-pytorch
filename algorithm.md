@@ -1,91 +1,94 @@
-# NoProp Algorithm: Mathematical Formulas (NoProp-DT)
+# Modified NoProp Algorithm: Mathematical Formulas (Working Implementation)
 
-This document collects the key mathematical formulas and definitions from the paper "NOPROP: TRAINING NEURAL NETWORKS WITHOUT BACK-PROPAGATION OR FORWARD-PROPAGATION" (arXiv:2503.24322v1), relevant to the Discrete-Time variant (NoProp-DT) and used during the implementation and discussion.
+**Note:** The formulas below describe the *modified* NoProp-DT implementation that achieved successful results (e.g., 99.01% on MNIST) in our experiments. This version **deviates significantly** from the original paper ("NOPROP: TRAINING...", arXiv:2403.13502v1), particularly in the prediction target of the blocks, the inference mechanism, and the input to the classifier during training. These modifications were necessary to achieve stable and effective learning in our setup.
 
 **Notation:**
-* `t`: Time step index, typically from 1 to T (in the paper).
+* `t`: Time step index, typically from 1 to T (for coefficients like alpha_t) or 0 to T (for alpha_bar_t). Code often uses 0-based index `t_idx = t-1`.
 * `x`: Input data (e.g., image).
 * `y`: True class label.
 * `u_y`: Embedding of the class label `y`.
-* `z_t`: Noisy representation at step `t`.
-* `alpha_t`, `alpha_bar_t`: Noise schedule parameters.
-* `u_hat_theta_t(z, x)`: Neural network block (parameterized by `theta_t`), predicting `u_y`.
-* `p_hat_theta_out(y|z)`: Final classifier (parameterized by `theta_out`).
+* `z_t`: Noisy representation at step `t` in the *forward* process `q`. $z_0$ is the (theoretical) clean embedding, $z_T$ is near pure noise. The inference process also generates states denoted by `z`, running from $z_T$ down to $z_0$.
+* $\alpha_t, \bar{\alpha}_t, \beta_t$: Noise schedule parameters.
+* $\epsilon, \epsilon_{target}$: Gaussian noise $\mathcal{N}(0, I)$.
+* $\hat{\epsilon}_{\theta_t}(z, x)`: Neural network block (parameterized by `theta_t`), predicting **noise $\epsilon$** (replaces $\hat{u}_{\theta_t}$).
+* $\hat{p}_{\theta_{out}}(y|z)`: Final classifier (parameterized by `theta_out`).
 * `q(...)`: Forward noising process (known).
 * `p(...)`: Reverse denoising/generation process (learned).
-* `N(z | mu, sigma^2 * I)`: Normal (Gaussian) distribution with mean vector `mu` and diagonal covariance matrix `sigma^2 * I`.
+* $\mathcal{N}(z | \mu, \sigma^2 I)$: Normal (Gaussian) distribution with mean vector $\mu$ and diagonal covariance matrix $\sigma^2 I$.
 
-## 1. Noise Schedule
+## 1. Noise Schedule (Same as Original)
 
-The implementation used a cosine schedule to define the cumulative product `alpha_bar_t`.
+A noise schedule determines how noise is added over T steps. We use `alpha_bar_t` (cumulative product of `alpha_t`) derived from a cosine schedule.
 
-* **`alpha_bar_t`**: Defined for `t = 0, 1, ..., T`. It's set by a cosine schedule such that `alpha_bar_0 = 1`, and `alpha_bar_T` is close to 0.
-    ```python
-    # Approximate logic for generating alpha_bar (where timesteps = T)
-    x = torch.linspace(0, timesteps, timesteps + 1)
-    alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
-    alphas_cumprod = alphas_cumprod / alphas_cumprod[0] # Ensures alpha_bar_0 = 1
-    ```
-* **`alpha_t`**: Derived from `alpha_bar_t` for `t = 1, ..., T`:
-    $$ \alpha_t = \frac{\bar{\alpha}_t}{\bar{\alpha}_{t-1}} $$
+* **$\bar{\alpha}_t$**: `t = 0, 1, ..., T`. Defined by cosine schedule, $\bar{\alpha}_0 = 1$, $\bar{\alpha}_T \approx 0$.
+* **$\alpha_t$**: `t = 1, ..., T`. $\alpha_t = \bar{\alpha}_t / \bar{\alpha}_{t-1}$.
+* **$\beta_t$**: `t = 1, ..., T`. $\beta_t = 1 - \alpha_t$.
 
-## 2. Forward Process `q` (Noising)
+## 2. Forward Process `q` (Noising - For Training Sampling)
 
-This process describes how to obtain a noisy representation `z_t` from the clean label embedding `u_y`. It's used to generate training examples for the blocks `u_hat_theta_t`.
+Used to generate noisy inputs `z_{t-1}` for training block `t` and the reconstructed $\hat{u}_T$ for training the classifier.
 
-* **Distribution of noisy embedding at step `t` (Eq. 6):**
+* **Distribution of noisy embedding `z_t` given clean `u_y`:**
     $$ q(z_t | y) = \mathcal{N}(z_t | \sqrt{\bar{\alpha}_t} u_y, (1 - \bar{\alpha}_t) I) $$
-    *Used for sampling the input `z_{t-1}` for training block `t` (where the time index is shifted relative to the sample) and for sampling `z_T` when training the classifier. Note the paper index `t=1..T`.*
+* **Sampling:** To get `z_{t-1}` for training block `t` (predicting noise $\epsilon$ added from $t-1 \to t$):
+    1. Sample $\epsilon \sim \mathcal{N}(0, I)$.
+    2. Compute $z_{t-1} = \sqrt{\bar{\alpha}_{t-1}} u_y + \sqrt{1 - \bar{\alpha}_{t-1}} \epsilon$.
 
-* **One-step reverse transition (Eq. 5):**
-    $$ q(z_{t-1} | z_t) = \mathcal{N}(z_{t-1} | \sqrt{\alpha_t} z_t, (1 - \alpha_t) I) $$
-    *Mainly used for deriving formulas.*
+## 3. Training Objective (Modified)
 
-## 3. Training Objective `L_NoProp` (Eq. 8)
+The model parameters ($\theta_t$ for blocks, $\theta_{out}$ for classifier, embedding weights) are optimized by minimizing a combined loss function using gradient descent (AdamW). The update follows the Algorithm 1 structure (outer `t` loop, updates within batch loop).
 
-This is the primary loss function minimized during training (or rather, the ELBO is maximized, which is equivalent to minimizing `-ELBO`).
+* **Total Loss (per batch, for combined update):**
+    $$ L_{total} = L_{classify} + \sum_{t=1}^{T} L_{denoise, t} $$
+    *(Note: In the outer loop structure, only one $L_{denoise, t}$ and the $L_{classify}$ contribute to the gradient for a given block's optimizer step, but $L_{classify}$ contributes to the final layer/embedding optimizer step in every batch iteration).*
+    *Implementation:* Our working code used a combined `.backward()` call on `weighted_loss_t + classify_loss`.
 
-$$
-\mathcal{L}_{NoProp} = \underbrace{\mathbb{E}_{q(z_T|y)}[-\log \hat{p}_{\theta_{out}}(y|z_T)]}_{\text{Classifier Loss}} + \underbrace{D_{KL}(q(z_0|y) || p(z_0))}_{\text{KL Term}} + \text{Denoising Loss Term}
-$$
+* **Denoising Loss (for block `t`, target $\epsilon$):**
+    $$ L_{denoise, t} = \eta \mathbb{E}_{y, \epsilon} \left[ || \hat{\epsilon}_{\theta_t}(z_{t-1}, x) - \epsilon ||^2 \right] $$
+    Where:
+        * $\epsilon \sim \mathcal{N}(0, I)$ is the sampled noise (target).
+        * $z_{t-1} = \sqrt{\bar{\alpha}_{t-1}} u_y + \sqrt{1 - \bar{\alpha}_{t-1}} \epsilon$ is the input to the block.
+        * $\hat{\epsilon}_{\theta_t}$ is the noise predicted by block `t` (network indexed `t-1` in code).
+        * $\eta$ is the hyperparameter `ETA_LOSS_WEIGHT` (e.g., 0.5 in the best run). Uniform weighting across `t` was used (no complex SNR-based weight).
 
-Where the Denoising Loss Term is:
-$$
-\frac{T}{2}\eta \mathbb{E}_{t \sim \mathcal{U}\{1,T\}, q(z_{t-1}|y)} \left[ (SNR(t) - SNR(t-1)) ||\hat{u}_{\theta_t}(z_{t-1}, x) - u_y||^2 \right]
-$$
+* **Classification Loss (Target $\hat{u}_T$):**
+    $$ L_{classify} = \mathbb{E}_{y, \epsilon_{T-1}} [ -\log \hat{p}_{\theta_{out}}(y | \hat{u}_T.detach()) ] $$
+    Where:
+        * $\epsilon_{T-1} \sim \mathcal{N}(0, I)$.
+        * $z_{T-1} = \sqrt{\bar{\alpha}_{T-1}} u_y + \sqrt{1 - \bar{\alpha}_{T-1}} \epsilon_{T-1}$.
+        * $\hat{\epsilon}_T = \hat{\epsilon}_{\theta_T}(z_{T-1}, x)$ is the noise predicted by the *last* block (index `T-1`).
+        * $\hat{u}_T = (z_{T-1} - \sqrt{1 - \bar{\alpha}_{T-1}} \hat{\epsilon}_T) / \sqrt{\bar{\alpha}_{T-1}}$ is the reconstructed clean embedding (predicted $z_0$).
+        * `.detach()` prevents gradients flowing into block `T-1` from this loss.
 
-* **`SNR(t)` (Signal-to-Noise Ratio):** Defined as (see after Eq. 8):
-    $$ SNR(t) = \frac{\bar{\alpha}_t}{1 - \bar{\alpha}_t} $$
-* **`p(z_0)` (Prior distribution):** Usually a standard normal distribution `p(z_0) = N(z_0 | 0, I)` (Eq. 7).
-* **`eta`:** Hyperparameter weighting the denoising term.
-* **Note 1:** In the implementation, the `D_KL` term was often ignored during gradient updates, as it might be constant with respect to model parameters `theta_t` and `theta_out`.
-* **Note 2:** In the implementation, the weight `SNR(t) - SNR(t-1)` at `t=1` was approximated as `SNR(1)` because `SNR(0)` is undefined.
-* **Note 3:** The expectation `E_{q(z_{t-1}|y)}` means that to compute the MSE loss for block `t`, the input `z_{t-1}` is sampled from `q(z_{t-1}|y)`.
+## 4. Reverse Process `p` (Inference - Modified DDPM-like Step)
 
-## 4. Reverse Process `p` (Inference / Generation)
+Generates a clean embedding prediction $z_0$ starting from pure noise $z_T$.
 
-This process describes how, starting from noise `z_0`, to sequentially generate `z_1, z_2, ..., z_T` using the learned blocks `u_hat_theta_t`.
+* **Initialization:** $z_T \sim \mathcal{N}(0, I)$.
+* **Iteration:** For `t` from `T` down to `1`:
+    1. Sample noise $\mathbf{z}' \sim \mathcal{N}(0, I)$ (if $t > 1$), else $\mathbf{z}' = 0$.
+    2. Predict noise using block `t`: $\hat{\epsilon} = \hat{\epsilon}_{\theta_t}(z_t, x)$ (using `model.blocks[t-1]` in code, which takes $z_t$ as input in the inference function).
+    3. Calculate conditional mean:
+       $$ \mu_{t-1}(z_t, x) = \frac{1}{\sqrt{\alpha_t}} \left( z_t - \frac{\beta_t}{\sqrt{1 - \bar{\alpha}_t}} \hat{\epsilon} \right) $$
+    4. Get conditional variance:
+       $$ \sigma_t^2 = \tilde{\beta}_t = \frac{1 - \bar{\alpha}_{t-1}}{1 - \bar{\alpha}_t} \beta_t $$
+       (Use $\sigma_t^2 = 0$ if $t=1$).
+    5. Sample previous state:
+       $$ z_{t-1} = \mu_{t-1}(z_t, x) + \sigma_t \mathbf{z}' $$
+* **Final Output:** $z_0$. This $z_0$ is then fed to the classifier.
 
-* **Initial step:** `z_0 ~ N(0, I)`.
-* **Iterative update (Eq. 3 and Eq. 7):** For `t` from 1 to `T`:
-    $$ z_t = \mu_t(z_{t-1}, \hat{u}_{\theta_t}(z_{t-1}, x)) + \sqrt{c_t} \epsilon_t, \quad \epsilon_t \sim \mathcal{N}(0, I) $$
-    Where `mu_t(z, u) = a_t u + b_t z`. Substituting `mu_t` gives the explicit formula:
-    $$ z_t = a_t \hat{u}_{\theta_t}(z_{t-1}, x) + b_t z_{t-1} + \sqrt{c_t} \epsilon_t $$
+## 5. Coefficients for Inference (Modified - DDPM-like)
 
-## 5. Inference Coefficients (`a_t, b_t, c_t`)
+The inference process requires these parameters from the noise schedule:
+* $\alpha_t = 1 - \beta_t$
+* $\beta_t$
+* $\bar{\alpha}_t = \prod_{i=1}^t \alpha_i$
+* $\bar{\alpha}_{t-1}$
+* $\sigma_t^2 = \tilde{\beta}_t = \frac{1 - \bar{\alpha}_{t-1}}{1 - \bar{\alpha}_t} \beta_t$ (Posterior variance, often precomputed)
 
-These coefficients link the noise schedule parameters (`alpha_t`, `alpha_bar_t`) to the dynamics of the reverse process. The formulas are given between Eq. 6 and 7 (derived in Appendix A.3). The index `t` runs from 1 to `T`.
+*(The coefficients $a_t, b_t, c_t$ from the original NoProp paper are **not used** in this modified inference process).*
 
-$$ a_t = \frac{\sqrt{\bar{\alpha}_t}(1 - \alpha_{t-1})}{1 - \bar{\alpha}_{t-1}} $$
-$$ b_t = \frac{\sqrt{\alpha_{t-1}}(1 - \bar{\alpha}_t)}{1 - \bar{\alpha}_{t-1}} $$
-$$ c_t = \frac{(1 - \bar{\alpha}_t)(1 - \alpha_{t-1})}{1 - \bar{\alpha}_{t-1}} $$
+## 6. Classifier Parameterization (Input Change)
 
-* **Note:** As discussed, these formulas are theoretically problematic at `t=1` because `alpha_bar_0 = 1`. The implementation used clamping (`clamp(..., min=1e-6)`) for the denominator and a heuristic (`alpha_0 = alpha_1`) to handle this boundary case practically.
-
-## 6. Classifier Parameterization (`p_theta_out`)
-
-* **Standard Approach (Eq. 14):** Uses a linear layer `f_{theta_out}` followed by Softmax.
-    $$ \hat{p}_{\theta_{out}}(y|z_T) = \text{softmax}(f_{\theta_{out}}(z_T))_y $$
-    *This is the approach implemented in the code using `nn.Linear` and `nn.CrossEntropyLoss`.*
-
-* **Alternative Approach (Eq. 15, 16):** The paper also describes a method using radial distance to class embeddings. *This was not used in the current implementation.*
+* The classifier $\hat{p}_{\theta_{out}}(y|...)$ remains a standard linear layer followed by Softmax (implicitly included in `nn.CrossEntropyLoss`).
+* **Key Change:** During **training**, it takes the *reconstructed clean embedding* $\hat{u}_T$ as input. During **inference**, it takes the final *denoised output* $z_0$ from the reverse process.
