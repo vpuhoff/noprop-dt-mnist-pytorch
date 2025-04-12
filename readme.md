@@ -48,9 +48,22 @@ After extensive debugging and significant modifications to the original algorith
 
 A full training run (up to 100 epochs) was performed using these parameters with a `CosineAnnealingLR` scheduler and early stopping.
 
-* **Training Observations:** The training process was stable. `Classify Loss` decreased significantly, `AvgDenoiseLoss` (MSE on $\epsilon$) remained active and stable, and the embedding norm was controlled.
-* **Final Result:** The model achieved a **best test accuracy of 99.01%** on MNIST, reached around epoch 80 before early stopping triggered at epoch 95.
+## Current Status & Experimental Results *(Updated Apr 12, 2025)*
 
+After extensive debugging and significant modifications to the original algorithm (predicting noise $\epsilon$, classifying from the predicted clean embedding $\hat{u}_T$), hyperparameter optimization (via Optuna over 10 epochs) identified a promising configuration (`LR=0.01`, `ETA=0.5`, `EMBED_WD=1e-7`).
+
+The hyperparameter optimization history is visualized below (showing the accuracy achieved by different parameter combinations within 10 epochs):
+
+![Optuna Optimization History](opt_history.png)
+
+A full training run (up to 100 epochs) was performed using these best parameters with a `CosineAnnealingLR` scheduler and early stopping (`patience=15`).
+
+* **Training Observations:** The training process was stable. `Classify Loss` decreased significantly, `AvgDenoiseLoss` (MSE on $\epsilon$) remained active and stable, and the embedding norm was controlled.
+* **Final Result:** The model achieved a **best test accuracy of 99.01%** on MNIST (reached around epoch 80, before early stopping triggered at epoch 95).
+
+The training progress during the final run (showing average training losses and test accuracy per epoch) is visualized below:
+
+![Final Training Progress Plot](training_accuracy_plot.png)
 ## Conclusions from Experiments
 
 * Reproducing the high accuracy reported in the paper using the method *as described* (predicting $u_y$) was unsuccessful in this implementation.
