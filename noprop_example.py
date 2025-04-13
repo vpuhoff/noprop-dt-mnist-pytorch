@@ -19,7 +19,7 @@ from tqdm import tqdm
 # Эти значения будут использоваться, если Optuna их не переопределит
 base_config: Dict[str, Any] = {
     # Diffusion settings
-    "T": 30,
+    "T": 5,
     "s_noise_schedule": 0.008,
 
     # Model architecture
@@ -52,10 +52,10 @@ base_config: Dict[str, Any] = {
 }
 
 # --- Параметры для HPO (если используется) ---
-STUDY_NAME = "find_params_attention_v1" # Новое имя study
-LR_TRIALS = [1e-2, 2e-3, 5e-4] # Возможно, потребуются другие LR
-ETA_LOSS_WEIGHT_TRIALS = [0.5, 1.0]
-EMBED_WD_TRIALS = [1e-6, 1e-7]
+STUDY_NAME = "find_params_attention_v3" # Новое имя study
+LR_TRIALS = [0.002, 0.001, 0.0001] # Возможно, потребуются другие LR
+ETA_LOSS_WEIGHT_TRIALS = [ 50.0, 100.0, 200.0]
+EMBED_WD_TRIALS = [1e-6, 0.0]
 
 # --- 2. Helper Functions (Без существенных изменений) ---
 progress_bar = None
@@ -380,7 +380,7 @@ def train_epoch(
     sqrt_one_minus_alphas_bar = diff_coeffs['sqrt_one_minus_alphas_bar']
 
     # --- Основной цикл обучения по блокам ---
-    for t_idx in range(T): # t_idx от 0 до T-1 (соответствует шагам 1 до T)
+    for t_idx in tqdm(range(T)): # t_idx от 0 до T-1 (соответствует шагам 1 до T)
         block_to_train = model.blocks[t_idx]
         optimizer_t = optimizers_blocks[t_idx]
 
@@ -777,7 +777,7 @@ def run_full_training(config: Dict[str, Any]):
 # --- Основной блок ---
 if __name__ == "__main__":
 
-    RUN_HPO = False # Установите True для запуска Optuna, False для полного обучения
+    RUN_HPO = True # Установите True для запуска Optuna, False для полного обучения
 
     if RUN_HPO:
         print("--- Starting Hyperparameter Optimization using Optuna (Attention Blocks) ---")
@@ -854,8 +854,8 @@ if __name__ == "__main__":
         #     print("Using best parameters found from HPO.")
         # else: # Параметры по умолчанию или выбранные вручную, если HPO не было
         full_run_config['LR'] = 0.002 # Пример: Выбрано вручную или из предыдущего опыта
-        full_run_config['ETA_LOSS_WEIGHT'] = 0.5   # Пример
-        full_run_config['EMBED_WD'] = 1e-07 # Пример
+        full_run_config['ETA_LOSS_WEIGHT'] = 0.01   # Пример
+        full_run_config['EMBED_WD'] = 1e-08 # Пример
         print("Using manually selected/default parameters for full run.")
 
         # Устанавливаем параметры для полного прогона (эпохи, планировщик, ранняя остановка)
