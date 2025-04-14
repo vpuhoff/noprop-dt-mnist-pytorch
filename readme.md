@@ -30,7 +30,7 @@ The goal of NoProp is to train neural networks without relying on traditional en
 
 ## Implementation Details (Final Working Configuration - Hybrid)
 
-![Architecture](https://www.mermaidchart.com/raw/8b1379d3-1772-4e46-8848-794b581db521?theme=light&version=v0.1&format=svg)
+![Architecture](architecture.svg)
 
 * **Framework:** PyTorch
 * **Method:** Modified NoProp-DT with **Hybrid Block Loss** (predicting noise $\epsilon$, classifying from $\hat{u}_T$).
