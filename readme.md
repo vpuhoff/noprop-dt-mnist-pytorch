@@ -56,7 +56,6 @@ A full training run (up to 100 epochs) was performed using the best found parame
 The training progress during the final run is visualized below:
 
 ![Final Hybrid Training Progress](training_progress_hybrid.png)
-*(Ensure training_progress_hybrid.png reflects the latest successful run and is in the correct path relative to README.md)*
 
 ## Conclusions from Experiments
 
