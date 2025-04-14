@@ -6,7 +6,7 @@ This repository contains an experimental PyTorch implementation exploring the **
 
 The goal of NoProp is to train neural networks without relying on traditional end-to-end backpropagation. Instead, it trains network layers (blocks) independently using a local denoising objective inspired by diffusion models.
 
-**Disclaimer:** This is an educational implementation attempt based on the paper. Achieving stable training and high accuracy required **significant deviations from the original method** described in the paper, particularly regarding the denoising target and classification mechanism. This implementation does not guarantee exact replication of the original work but demonstrates the feasibility of a modified approach.
+**Disclaimer:** This is an educational implementation attempt based on the paper. Achieving stable training and high accuracy required **significant deviations from the original method** described in the paper, particularly regarding the denoising target, the block loss function, and the classification mechanism. This implementation demonstrates the feasibility of a modified, hybrid approach.
 
 ## Source Paper
 
@@ -23,54 +23,47 @@ The goal of NoProp is to train neural networks without relying on traditional en
 
 * **Problems & Modifications in this Implementation:**
     * Training blocks to predict the clean `u_y` proved unstable and ineffective.
-    * **Key Change 1:** The objective of the blocks was changed to predict the **added noise $\epsilon$**, similar to standard diffusion models (DDPM, VDM, CARD). Denoising loss became MSE between predicted and actual noise.
-    * **Key Change 2:** The classifier was trained on the **predicted clean embedding $\hat{u}_T$** (reconstructed from $z_{T-1}$ and predicted $\hat{\epsilon}_T$), instead of the noisy sample $z_T$.
-    * **Key Change 3:** Inference was modified to a **DDPM-like reverse process** using the predicted noise $\epsilon$.
+    * **Key Change 1:** The objective of the blocks was changed to predict the **added noise $\epsilon$**, similar to standard diffusion models (DDPM, VDM, CARD).
+    * **Key Change 2 (Hybrid Block Loss):** The loss for updating block `t` became a **combination** of local noise prediction ($MSE(\hat{\epsilon}, \epsilon)$) and a global target reconstruction loss ($MSE(\hat{u}_t, u_y)$), where $\hat{u}_t$ is the clean embedding reconstructed using the predicted $\hat{\epsilon}$.
+    * **Key Change 3:** The classifier was trained on the **predicted clean embedding $\hat{u}_T$** (reconstructed from $z_{T-1}$ and predicted $\hat{\epsilon}_T$), instead of the noisy sample $z_T$.
+    * **Key Change 4:** Inference was modified to a **DDPM-like reverse process** using the predicted noise $\epsilon$.
 
-## Implementation Details (Final Working Configuration)
+## Implementation Details (Final Working Configuration - Hybrid)
 
 * **Framework:** PyTorch
-* **Method:** Modified NoProp-DT (predicting noise $\epsilon$, classifying from $\hat{u}_T$)
+* **Method:** Modified NoProp-DT with **Hybrid Block Loss** (predicting noise $\epsilon$, classifying from $\hat{u}_T$).
 * **Dataset:** MNIST
-* **Architecture:** Based on Figure 7 (left) from the paper's appendix (CNN for image, MLP for embedding, combined layers). Block output is predicted noise $\epsilon$ (`embed_dim`).
-* **Embeddings:** Learned (`dim=20`), orthogonal initialization, embedding norm clipping (`max_norm_embed=50.0`), very low weight decay (`embed_wd=1e-7`).
-* **Noise Schedule:** Cosine schedule (`alphas_bar`), T=10 steps.
-* **Denoising Loss Weight:** Uniform weight scaled by `ETA_LOSS_WEIGHT=0.5`.
-* **Inference:** Implemented DDPM-like reverse steps using predicted $\epsilon$.
-* **Optimizer:** AdamW with initial `LR=0.01` for all parameters, `Weight Decay=1e-3` for blocks/classifier.
-* **Scheduler:** `CosineAnnealingLR` (`T_max=100`, `eta_min=1e-6`) applied to all optimizers.
+* **Architecture:** CNN+MLP blocks (`DenoisingBlockPaper`) predicting noise $\epsilon$.
+* **Block Loss:** Combined $L_{block\_t} = \eta_1 MSE(\hat{\epsilon}, \epsilon) + \eta_2 MSE(\hat{u}_t, u_y)$, where $\hat{u}_t$ is reconstructed from $\hat{\epsilon}$. Classifier loss $L_{classify}=CE(\text{classifier}(\hat{u}_T), y)$. Combined update used for optimizers.
+* **Embeddings:** Learned (`dim=20`), orthogonal initialization, norm clipping (`max_norm_embed=50.0`), very low weight decay (`embed_wd=1e-7`).
+* **Noise Schedule:** Cosine schedule, T=10 steps.
+* **Loss Weights:** `ETA_LOSS_WEIGHT`($\eta_1$, for MSE on $\epsilon$) = 2.0, `LAMBDA_GLOBAL`($\eta_2$, for MSE on $\hat{u}_t$) = 1.0. *(Based on final successful run parameters)*
+* **Inference:** DDPM-like reverse steps using predicted $\epsilon$.
+* **Optimizer:** AdamW with initial `LR=0.01`, `Weight Decay=1e-3` for blocks/classifier.
+* **Scheduler:** `CosineAnnealingLR` (`T_max=100`, `eta_min=1e-6`).
 * **Stabilization:** Gradient clipping (`max_norm=1.0`).
 * **Epochs:** Trained up to 100 epochs with early stopping (`patience=15`).
 
-## Current Status & Experimental Results *(Updated Apr 12, 2025)*
+## Current Status & Experimental Results *(Updated Apr 14, 2025)*
 
-After extensive debugging and significant modifications to the original algorithm (predicting noise $\epsilon$, classifying from $\hat{u}_T$), hyperparameter optimization identified an effective configuration (`LR=0.01`, `ETA=0.5`, `EMBED_WD=1e-7`).
+After extensive debugging, significant modifications (predicting noise $\epsilon$, classifying from $\hat{u}_T$, implementing a hybrid block loss), and hyperparameter tuning, a successful training configuration was identified.
 
-A full training run (up to 100 epochs) was performed using these parameters with a `CosineAnnealingLR` scheduler and early stopping.
+A full training run (up to 100 epochs) was performed using the best found parameters (`LR=0.01` initial, `ETA=2.0`, `LAMBDA=1.0`, `EMBED_WD=1e-7`), with a `CosineAnnealingLR` scheduler and early stopping.
 
-## Current Status & Experimental Results *(Updated Apr 12, 2025)*
+* **Training Observations:** The training process was stable. Both denoising and classification losses decreased appropriately without collapsing. The embedding norm remained controlled.
+* **Final Result:** The model achieved an excellent **best test accuracy of 99.40%** on MNIST (reached around epoch 85-100, before early stopping triggered at epoch 100 based on patience).
 
-After extensive debugging and significant modifications to the original algorithm (predicting noise $\epsilon$, classifying from the predicted clean embedding $\hat{u}_T$), hyperparameter optimization (via Optuna over 10 epochs) identified a promising configuration (`LR=0.01`, `ETA=0.5`, `EMBED_WD=1e-7`).
+The training progress during the final run is visualized below:
 
-The hyperparameter optimization history is visualized below (showing the accuracy achieved by different parameter combinations within 10 epochs):
+![Final Hybrid Training Progress](training_progress_hybrid.png)
+*(Ensure training_progress_hybrid.png reflects the latest successful run and is in the correct path relative to README.md)*
 
-![Optuna Optimization History](opt_history.png)
-
-A full training run (up to 100 epochs) was performed using these best parameters with a `CosineAnnealingLR` scheduler and early stopping (`patience=15`).
-
-* **Training Observations:** The training process was stable. `Classify Loss` decreased significantly, `AvgDenoiseLoss` (MSE on $\epsilon$) remained active and stable, and the embedding norm was controlled.
-* **Final Result:** The model achieved a **best test accuracy of 99.01%** on MNIST (reached around epoch 80, before early stopping triggered at epoch 95).
-
-The training progress during the final run (showing average training losses and test accuracy per epoch) is visualized below:
-
-![Final Training Progress Plot](training_accuracy_plot.png)
 ## Conclusions from Experiments
 
-* Reproducing the high accuracy reported in the paper using the method *as described* (predicting $u_y$) was unsuccessful in this implementation.
-* Significant **modifications** (changing the prediction target to noise $\epsilon$, altering the classifier input to $\hat{u}_T$) were **essential** to achieve effective and stable learning.
-* The modified approach, combined with careful hyperparameter tuning (using HPO), appropriate LR scheduling, and stabilization techniques (clipping), successfully trained a model achieving **high accuracy (99.01%)** on MNIST.
-* This result demonstrates the potential of backpropagation-free, diffusion-inspired training methods, although it required deviating significantly from the specific formulation presented in the NoProp paper but aligning more closely with established diffusion model practices (like DDPM, VDM, CARD).
-* The small remaining gap to the paper's reported result (>99.4%) might be due to further subtle implementation differences, architectural details, or hyperparameter settings.
+* Reproducing the results using the method *as described* in the original NoProp paper (predicting $u_y$) was unsuccessful in this implementation due to instability and collapsing losses.
+* Significant **modifications** were essential: changing the prediction target to noise $\epsilon$, altering the classifier input to the reconstructed $\hat{u}_T$, and crucially, implementing a **hybrid block loss** combining local noise prediction and global target reconstruction ($L_{block\_t} = \eta_1 MSE(\hat{\epsilon}, \epsilon) + \eta_2 MSE(\hat{u}_t, u_y)$).
+* This **modified hybrid approach**, combined with careful hyperparameter tuning, LR scheduling, and stabilization techniques, successfully trained a model achieving **high accuracy (99.40%)** on MNIST, matching the performance levels mentioned in the source paper but using a different underlying mechanism.
+* This result demonstrates the strong potential of backpropagation-free, diffusion-inspired training, although achieving it required significant adaptation and hybridization of the originally proposed NoProp method, aligning it more closely with established diffusion model practices while incorporating elements of global target guidance locally.
 
 ## Setup
 
@@ -87,7 +80,7 @@ The training progress during the final run (showing average training losses and 
     ./setup_env.sh
     ```
 6.  Activate the environment: `source noprop_env/bin/activate`
-7.  Run the script (e.g., for a full run): `python noprop_example.py` (make sure `RUN_HPO = False` inside the script).
+7.  Run the script (e.g., for a full run): `python noprop_example.py` (make sure `RUN_HPO = False` inside the script and the correct final hyperparameters are set in the `else` block).
 
 **Option 2: Manual Installation**
 1.  Ensure you have Python 3 installed.

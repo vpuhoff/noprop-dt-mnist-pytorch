@@ -45,9 +45,9 @@ config: Dict[str, Any] = {
     "num_workers": 2,
 }
 
-STUDY_NAME = "find_params_v5"
-LR_TRIALS = [5e-2, 1e-2, 2e-3]
-ETA_LOSS_WEIGHT_TRIALS = [0.5, 1.0, 1.5]
+STUDY_NAME = "find_params_v6"
+LR_TRIALS = [0.1, 1e-2, 1e-3, 1e-4]
+ETA_LOSS_WEIGHT_TRIALS = [0.5, 1.0, 1.5, 2.0]
 EMBED_WD_TRIALS = [1e-5, 1e-6, 1e-7]
 
 # --- 2. Helper Functions ---
@@ -445,17 +445,12 @@ def objective(trial: optuna.trial.Trial) -> float:
 
 def write_plots(study):
     #You can visualize results if needed (requires pip install optuna-dashboard or plotly)
-    try:
-        fig1 = optuna.visualization.plot_optimization_history(study)
-        #fig1.show(renderer="browser")  # откроется в браузере
-        fig1.write_image("opt_history.png")
-        fig2 = optuna.visualization.plot_param_importances(study)
-        #fig2.show(renderer="browser")
-        fig2.write_image("param_importance.png")
-    except ImportError:
-        print("\nInstall plotly and kaleido to visualize Optuna results: pip install plotly kaleido")
-    except Exception as e_vis:
-        print(f"Could not plot Optuna results: {e_vis}")
+    fig1 = optuna.visualization.plot_optimization_history(study)
+    #fig1.show(renderer="browser")  # откроется в браузере
+    fig1.write_image("opt_history.png")
+    fig2 = optuna.visualization.plot_param_importances(study)
+    #fig2.show(renderer="browser")
+    fig2.write_image("param_importance.png")
 
 # --- Функция для полного обучения (Запускает основной цикл) ---
 def run_full_training(config: Dict[str, Any]):
@@ -616,7 +611,7 @@ def run_full_training(config: Dict[str, Any]):
 # --- Основной блок ---
 if __name__ == "__main__":
 
-    RUN_HPO = True # Установите True для запуска Optuna
+    RUN_HPO = False # Установите True для запуска Optuna
 
     if RUN_HPO:
         print("--- Starting Hyperparameter Optimization using Optuna ---")
@@ -675,10 +670,10 @@ if __name__ == "__main__":
         # --- Параметры для полного прогона гибридной модели ---
         # Основываемся на лучших параметрах предыдущего успешного запуска
         # и добавляем LAMBDA_GLOBAL
-        hybrid_config['LR'] = 1e-3 # Попробуем снова 1e-3 с планировщиком
-        hybrid_config['ETA_LOSS_WEIGHT'] = 0.5 # Вес для MSE(eps)
+        hybrid_config['LR'] = 0.01 # Попробуем снова 1e-3 с планировщиком
+        hybrid_config['ETA_LOSS_WEIGHT'] = 2.0 # Вес для MSE(eps)
         hybrid_config['LAMBDA_GLOBAL'] = 1.0 # Вес для MSE(u_y) - НОВЫЙ, можно тюнить
-        hybrid_config['EMBED_WD'] = 1e-5 # Маленький WD для эмбеддингов
+        hybrid_config['EMBED_WD'] = 1e-7 # Маленький WD для эмбеддингов
         hybrid_config['WEIGHT_DECAY'] = 1e-3 # WD для остального
 
         # Параметры полного прогона
