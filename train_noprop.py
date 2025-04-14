@@ -43,7 +43,7 @@ config: Dict[str, Any] = {
     "EPOCHS": 10, # Эпохи для HPO или коротких тестов
     "LR": 1e-3,
     "WEIGHT_DECAY": 1e-3,
-    "EMBED_WD": 1e-5,
+    "EMBED_WD": 1e-7,
     "MAX_NORM_EMBED": 50.0,
     "GRAD_CLIP_MAX_NORM": 1.0,
     "ETA_LOSS_WEIGHT": 0.5,
@@ -61,10 +61,10 @@ config: Dict[str, Any] = {
 
 # --- Константы для HPO ---
 # <--- ИЗМЕНЕНИЕ: Обновлено имя исследования для Fashion-MNIST
-STUDY_NAME = "fmnist_find_params_v1"
-LR_TRIALS = [0.1, 1e-2, 1e-3, 1e-4]
-ETA_LOSS_WEIGHT_TRIALS = [0.5, 1.0, 1.5, 2.0]
-LAMBDA_GLOBAL_TRIALS = [0.5, 1.0, 1.5, 2.0]
+STUDY_NAME = "fmnist_find_params_v2"
+LR_TRIALS = [5e-3, 1e-2, 2e-2]
+ETA_LOSS_WEIGHT_TRIALS = [1.0, 2.0, 3.0]
+LAMBDA_GLOBAL_TRIALS = [0.5, 1.0, 1.5]
 EMBED_WD_TRIALS = [1e-5, 1e-6, 1e-7]
 
 # --- 2. Вспомогательные функции (Optuna, Init - без изменений) ---
@@ -74,6 +74,7 @@ progress_bar = None
 def tqdm_callback(study, trial):
     if progress_bar:
         progress_bar.update(1)
+    write_optuna_plots(study)
 
 def initialize_embeddings(num_classes: int, embed_dim: int, device: torch.device) -> nn.Embedding:
     """Инициализирует эмбеддинги меток."""
@@ -282,7 +283,7 @@ def objective(trial: optuna.trial.Trial) -> float:
     run_config['LR'] = trial.suggest_categorical('LR', LR_TRIALS)
     run_config['ETA_LOSS_WEIGHT'] = trial.suggest_categorical('ETA_LOSS_WEIGHT', ETA_LOSS_WEIGHT_TRIALS)
     run_config['LAMBDA_GLOBAL'] = trial.suggest_categorical('LAMBDA_GLOBAL', LAMBDA_GLOBAL_TRIALS)
-    run_config['EMBED_WD'] = trial.suggest_categorical('EMBED_WD', EMBED_WD_TRIALS)
+    #run_config['EMBED_WD'] = trial.suggest_categorical('EMBED_WD', EMBED_WD_TRIALS)
     run_config['EPOCHS'] = 10 # Короткий прогон для HPO
 
     print(f"\n--- Starting Optuna Trial {trial.number} with config: ---")
@@ -483,15 +484,15 @@ if __name__ == "__main__":
 
     # Установите True для запуска Optuna HPO на FashionMNIST
     # Установите False для запуска полного обучения с заданными параметрами
-    RUN_HPO = False # <--- РЕКОМЕНДУЕТСЯ УСТАНОВИТЬ True для первого запуска на FashionMNIST
+    RUN_HPO = True # <--- РЕКОМЕНДУЕТСЯ УСТАНОВИТЬ True для первого запуска на FashionMNIST
 
     if RUN_HPO:
         print("--- Starting Hyperparameter Optimization for FashionMNIST ---") # <--- ИЗМЕНЕНИЕ
         search_space = {
-             'LR': LR_TRIALS,
-             'ETA_LOSS_WEIGHT': ETA_LOSS_WEIGHT_TRIALS,
-             'LAMBDA_GLOBAL': LAMBDA_GLOBAL_TRIALS,
-             'EMBED_WD': EMBED_WD_TRIALS
+            'LR': LR_TRIALS,
+            'ETA_LOSS_WEIGHT': ETA_LOSS_WEIGHT_TRIALS,
+            'LAMBDA_GLOBAL': LAMBDA_GLOBAL_TRIALS,
+            #'EMBED_WD': EMBED_WD_TRIALS
         }
         n_trials = 1
         for key in search_space: n_trials *= len(search_space[key])

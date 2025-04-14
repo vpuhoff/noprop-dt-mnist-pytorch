@@ -1,5 +1,5 @@
 noprop_env
 data/*
-optuna_results.db
 best_fmnist_noprop_model.pth
 *.pyc
+*.db

@@ -1,0 +1,7 @@
+# Results for fmnist_find_params_v2
+Best Trial: 10
+Best Value (Accuracy %): 80.36
+Best Params:
+  'LR': 0.01,
+  'ETA_LOSS_WEIGHT': 2.0,
+  'LAMBDA_GLOBAL': 1.5,
