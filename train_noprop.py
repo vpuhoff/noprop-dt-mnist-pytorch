@@ -20,7 +20,7 @@ config: Dict[str, Any] = {
     "T": 10,
     "s_noise_schedule": 0.008,
     # Model architecture
-    "EMBED_DIM": 20,
+    "EMBED_DIM": 40,
     "NUM_CLASSES": 10,
     "IMG_SIZE": 28,
     "IMG_CHANNELS": 1,
