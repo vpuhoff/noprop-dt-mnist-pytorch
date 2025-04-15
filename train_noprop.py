@@ -61,10 +61,10 @@ config: Dict[str, Any] = {
 
 # --- Константы для HPO ---
 # <--- ИЗМЕНЕНИЕ: Обновлено имя исследования для Fashion-MNIST
-STUDY_NAME = "fmnist_find_params_v2"
-LR_TRIALS = [5e-3, 1e-2, 2e-2]
-ETA_LOSS_WEIGHT_TRIALS = [1.0, 2.0, 3.0]
-LAMBDA_GLOBAL_TRIALS = [0.5, 1.0, 1.5]
+STUDY_NAME = "fmnist_find_params_v3"
+LR_TRIALS = [0.01, 0.1, 0.001]
+ETA_LOSS_WEIGHT_TRIALS = [1.5, 2.0, 2.5]
+LAMBDA_GLOBAL_TRIALS = [1.5, 2.0, 2.5]
 EMBED_WD_TRIALS = [1e-5, 1e-6, 1e-7]
 
 # --- 2. Вспомогательные функции (Optuna, Init - без изменений) ---
@@ -284,7 +284,7 @@ def objective(trial: optuna.trial.Trial) -> float:
     run_config['ETA_LOSS_WEIGHT'] = trial.suggest_categorical('ETA_LOSS_WEIGHT', ETA_LOSS_WEIGHT_TRIALS)
     run_config['LAMBDA_GLOBAL'] = trial.suggest_categorical('LAMBDA_GLOBAL', LAMBDA_GLOBAL_TRIALS)
     #run_config['EMBED_WD'] = trial.suggest_categorical('EMBED_WD', EMBED_WD_TRIALS)
-    run_config['EPOCHS'] = 10 # Короткий прогон для HPO
+    run_config['EPOCHS'] = 20 # Короткий прогон для HPO
 
     print(f"\n--- Starting Optuna Trial {trial.number} with config: ---")
     print(f"  LR: {run_config['LR']:.1e}, ETA_L: {run_config['ETA_LOSS_WEIGHT']:.1f}, LAMBDA_G: {run_config['LAMBDA_GLOBAL']:.1f}, EmbedWD: {run_config['EMBED_WD']:.1e}")
@@ -484,7 +484,7 @@ if __name__ == "__main__":
 
     # Установите True для запуска Optuna HPO на FashionMNIST
     # Установите False для запуска полного обучения с заданными параметрами
-    RUN_HPO = True # <--- РЕКОМЕНДУЕТСЯ УСТАНОВИТЬ True для первого запуска на FashionMNIST
+    RUN_HPO = False # <--- РЕКОМЕНДУЕТСЯ УСТАНОВИТЬ True для первого запуска на FashionMNIST
 
     if RUN_HPO:
         print("--- Starting Hyperparameter Optimization for FashionMNIST ---") # <--- ИЗМЕНЕНИЕ
@@ -566,9 +566,9 @@ if __name__ == "__main__":
         # --- !!! ВАЖНО: Установите здесь лучшие параметры для FashionMNIST !!! ---
         # Используйте найденные HPO или начните с базовых/MNIST параметров и тюньте
         best_params_for_full_run = {
-            'LR': 1e-3,             # Пример: начать с этого или с лучших от MNIST/HPO
-            'ETA_LOSS_WEIGHT': 1.0, # Пример
-            'LAMBDA_GLOBAL': 1.0,   # Пример
+            'LR': 1e-2,             # Пример: начать с этого или с лучших от MNIST/HPO
+            'ETA_LOSS_WEIGHT': 1.5, # Пример
+            'LAMBDA_GLOBAL': 2.5,   # Пример
             'EMBED_WD': 1e-6,       # Пример
         }
         print("*"*10 + " WARNING: Using default parameters for full run. " + "*"*10)
