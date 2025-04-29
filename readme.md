@@ -13,6 +13,7 @@ The goal of NoProp is to train neural networks without relying on traditional en
 * **Title:** NOPROP: TRAINING NEURAL NETWORKS WITHOUT BACK-PROPAGATION OR FORWARD-PROPAGATION
 * **Authors:** Qinyu Li, Yee Whye Teh, Razvan Pascanu
 * **arXiv:** [https://arxiv.org/abs/2503.24322v1](https://arxiv.org/abs/2503.24322v1) 
+* **Wiki:** [https://deepwiki.com/vpuhoff/noprop-dt-mnist-pytorch](https://deepwiki.com/vpuhoff/noprop-dt-mnist-pytorch/1-home)
 
 ## Core Concept of NoProp (and Implementation Differences)
 
