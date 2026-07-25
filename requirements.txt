@@ -26,7 +26,7 @@ nvidia-nvjitlink-cu12==12.4.127
 nvidia-nvtx-cu12==12.4.127
 optuna==4.2.1
 packaging==24.2
-pillow==11.1.0
+pillow==12.3.0
 plotly==6.0.1
 PyYAML==6.0.2
 SQLAlchemy==2.0.40
