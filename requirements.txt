@@ -29,7 +29,7 @@ packaging==24.2
 pillow==11.1.0
 plotly==6.0.1
 PyYAML==6.0.2
-SQLAlchemy==2.0.40
+SQLAlchemy==2.0.52
 sympy==1.13.1
 torch==2.6.0
 torchvision==0.21.0
