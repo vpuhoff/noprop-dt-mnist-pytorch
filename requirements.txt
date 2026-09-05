@@ -1,4 +1,4 @@
-alembic==1.15.2
+alembic==1.19.2
 colorlog==6.9.0
 filelock==3.18.0
 fsspec==2025.3.2
