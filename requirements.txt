@@ -28,7 +28,7 @@ optuna==4.2.1
 packaging==26.3
 pillow==11.1.0
 plotly==7.1.0
-PyYAML==6.0.2
+PyYAML==6.0.3
 SQLAlchemy==2.0.40
 sympy==1.13.1
 torch==2.6.0
