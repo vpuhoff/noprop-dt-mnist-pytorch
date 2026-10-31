@@ -25,7 +25,7 @@ nvidia-nccl-cu12==2.21.5
 nvidia-nvjitlink-cu12==12.4.127
 nvidia-nvtx-cu12==12.4.127
 optuna==4.2.1
-packaging==24.2
+packaging==26.3
 pillow==11.1.0
 plotly==6.0.1
 PyYAML==6.0.2
